@@ -32,7 +32,7 @@ class LiveOneTrainingArguments(LiveTrainingArguments):
     live_version: str = 'live1'
     frame_token_cls: bool = True
     frame_num_tokens: int = 1
-    frame_token_interval: str  = ''
+    frame_token_interval: str  = ','
     embed_mark: str = '2fps_384_1'
     max_num_frames: int = 7200 # 1h, 2fps, 7200 frames
 
