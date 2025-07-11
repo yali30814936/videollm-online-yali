@@ -6,6 +6,7 @@ from transformers.utils import logging
 
 from .configuration_live_llama import LiveLlamaConfig
 from ..modeling_live import build_live, LiveMixin
+from ..connectors import build_connector
 
 logger = logging.get_logger(__name__)
 
@@ -15,10 +16,11 @@ class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
 
     def __init__(self, config: LiveLlamaConfig):
         super().__init__(config)
-        self.connector = torch.nn.Sequential(
-            torch.nn.Linear(config.vision_hidden_size, config.hidden_size, bias=True),
-            GELUActivation(config.hidden_size),
-            torch.nn.Linear(config.hidden_size, config.hidden_size, bias=True),
+        self.connector = build_connector(
+            connector_type=getattr(config, 'connector_type', 'mlp'),
+            input_dim=config.vision_hidden_size,
+            hidden_dim=config.hidden_size,
+            output_dim=config.hidden_size
         )
 
     def forward(
