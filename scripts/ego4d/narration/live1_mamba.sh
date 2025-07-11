@@ -18,7 +18,7 @@ ${launcher} train.py --deepspeed configs/deepspeed/zero2.json \
     --gradient_checkpointing True \
     --evaluation_strategy no \
     --prediction_loss_only False \
-    --save_strategy step \
+    --save_strategy steps \
     --save_steps 500 \
     --learning_rate 0.0002 \
     --optim adamw_torch \
@@ -29,4 +29,6 @@ ${launcher} train.py --deepspeed configs/deepspeed/zero2.json \
     --bf16 True \
     --tf32 True \
     --report_to tensorboard \
-    --output_dir outputs/ego4d_narration_train/live1 \
+    --connector_type mamba \
+    --finetune_modules connector \
+    --output_dir outputs/ego4d_narration_train/live1_mamba \
