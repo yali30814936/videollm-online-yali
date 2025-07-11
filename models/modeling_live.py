@@ -200,16 +200,38 @@ def build_live(
     model = model_class.from_pretrained(llm_pretrained, config=config_class.from_pretrained(llm_pretrained, **kwargs), torch_dtype=torch_dtype, attn_implementation=attn_implementation)
     tokenizer = build_live_tokenizer_and_update_config(llm_pretrained, model.config)
     if is_training:
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_modules,
-            lora_dropout=0.05,
-            task_type="CAUSAL_LM",
-            modules_to_save=finetune_modules,
-            inference_mode=False,
-        )
-        model = get_peft_model(model, lora_config)
+        # Handle connector finetuning based on connector type
+        connector_type = getattr(model.config, 'connector_type', 'mlp')
+        
+        if connector_type == 'mlp':
+            # For MLP connector, use manual finetuning due to PEFT compatibility issues
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_modules,
+                lora_dropout=0.05,
+                task_type="CAUSAL_LM",
+                modules_to_save=[],  # Empty for MLP
+                inference_mode=False,
+            )
+            model = get_peft_model(model, lora_config)
+            
+            # Manually enable connector training
+            for param in model.base_model.model.connector.parameters():
+                param.requires_grad = True
+        else:
+            # For other connectors (like Mamba), use modules_to_save
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_modules,
+                lora_dropout=0.05,
+                task_type="CAUSAL_LM",
+                modules_to_save=finetune_modules,
+                inference_mode=False,
+            )
+            model = get_peft_model(model, lora_config)
+        
         model.print_trainable_parameters()
     else:
         if resume_from_checkpoint:

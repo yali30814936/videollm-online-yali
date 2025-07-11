@@ -45,16 +45,16 @@ def build_connector(connector_type: str, input_dim: int, hidden_dim: int, output
         Connector module
     """
     if connector_type == 'mlp':
-        return MLPConnector(input_dim, output_dim, output_dim)
+        return MLPConnector(input_dim, hidden_dim, output_dim)
     elif connector_type == 'mamba':
         if not MAMBA_AVAILABLE:
             print("Warning: mamba-ssm not available, falling back to MLP connector")
-            return MLPConnector(input_dim, output_dim, output_dim)
+            return MLPConnector(input_dim, hidden_dim, output_dim)
         
         # Check if CUDA is available for Mamba
         if not torch.cuda.is_available():
             print("Warning: CUDA not available, Mamba requires CUDA. Falling back to MLP connector")
-            return MLPConnector(input_dim, output_dim, output_dim)
+            return MLPConnector(input_dim, hidden_dim, output_dim)
             
         return MambaConnector(input_dim, hidden_dim, output_dim, **kwargs)
     else:
