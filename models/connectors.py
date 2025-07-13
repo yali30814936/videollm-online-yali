@@ -1,16 +1,9 @@
-import torch
+# import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional
-
-try:
-    from mamba_ssm.modules.mamba_simple import Mamba
-    MAMBA_AVAILABLE = True
-except ImportError:
-    MAMBA_AVAILABLE = False
-    Mamba = None
-    print("Warning: mamba-ssm not available, falling back to MLP connector")
+# import einops
+from mamba_ssm.models.mixer_seq_simple import create_block, _init_weights
+from functools import partial
 
 
 class MLPConnector(nn.Module):
@@ -47,15 +40,6 @@ def build_connector(connector_type: str, input_dim: int, hidden_dim: int, output
     if connector_type == 'mlp':
         return MLPConnector(input_dim, hidden_dim, output_dim)
     elif connector_type == 'mamba':
-        if not MAMBA_AVAILABLE:
-            print("Warning: mamba-ssm not available, falling back to MLP connector")
-            return MLPConnector(input_dim, hidden_dim, output_dim)
-        
-        # Check if CUDA is available for Mamba
-        if not torch.cuda.is_available():
-            print("Warning: CUDA not available, Mamba requires CUDA. Falling back to MLP connector")
-            return MLPConnector(input_dim, hidden_dim, output_dim)
-            
         return MambaConnector(input_dim, hidden_dim, output_dim, **kwargs)
     else:
         raise ValueError(f"Unsupported connector type: {connector_type}. Supported types: 'mlp', 'mamba'")
@@ -63,8 +47,8 @@ def build_connector(connector_type: str, input_dim: int, hidden_dim: int, output
 
 class MambaConnector(nn.Module):
     """
-    High-performance connector using official Mamba implementation.
-    Provides optimized state space modeling with CUDA kernels.
+    Mamba-based connector inspired by Video_Mamba_Seq but simplified for embedding processing.
+    Based on the borrowed code structure but without PreNet, PostNet, ClsNet and pytorch_lightning.
     """
     
     def __init__(
@@ -72,56 +56,43 @@ class MambaConnector(nn.Module):
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
-        mamba_d_state: int = 16,
-        mamba_d_conv: int = 4,
-        mamba_expand: int = 2,
-        num_layers: int = 1
+        n_ssm: int = 2,
+        **kwargs
     ):
         super().__init__()
-        
-        if not MAMBA_AVAILABLE:
-            raise ImportError("mamba-ssm is required for MambaConnector. Please install it with: pip install mamba-ssm")
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
-        self.num_layers = num_layers
+        self.n_ssm = n_ssm
         
-        # Input projection to Mamba's expected dimension
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        # Input projection with non-linearity (替代 PreNet，包含 LeakyReLU)
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LeakyReLU()
+        )
         
-        # Mamba layers
-        if not MAMBA_AVAILABLE or Mamba is None:
-            raise ImportError("mamba-ssm is required for MambaConnector")
-            
-        self.mamba_layers = nn.ModuleList([
-            Mamba(
-                d_model=hidden_dim,
-                d_state=mamba_d_state,
-                d_conv=mamba_d_conv,
-                expand=mamba_expand,
-                bias=True,
-                conv_bias=True,
-            )
-            for _ in range(num_layers)
+        # Mamba SSM layers (基於借來的代碼設計)
+        self.ssms = nn.ModuleList([
+            create_block(hidden_dim, d_intermediate=0, layer_idx=i) 
+            for i in range(n_ssm)
         ])
         
-        # Layer norms for residual connections
-        if num_layers > 1:
-            self.layer_norms = nn.ModuleList([
-                nn.LayerNorm(hidden_dim) for _ in range(num_layers)
-            ])
+        # Layer normalization (基於借來的代碼)
+        self.norm_fn = nn.LayerNorm(hidden_dim)
         
-        # Output projection
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
-        self.final_norm = nn.LayerNorm(hidden_dim)
+        # Output projection with non-linearity (替代 PostNet，包含 LeakyReLU)
+        self.output_proj = nn.Sequential(
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
         
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.1)
+        # Initialize weights using the borrowed code's method
+        self.apply(partial(_init_weights, n_layer=n_ssm))
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass using official Mamba implementation.
+        Forward pass based on Video_Mamba_Seq design but simplified.
         
         Args:
             x: Input tensor [batch, seq_len, input_dim]
@@ -129,29 +100,35 @@ class MambaConnector(nn.Module):
         Returns:
             Output tensor [batch, seq_len, output_dim]
         """
-        # Check if CUDA is available and move to GPU if needed
-        if torch.cuda.is_available() and not x.is_cuda:
-            device = torch.cuda.current_device()
-            x = x.to(device)
-            self.to(device)
+        # Input projection with LeakyReLU (基於 PreNet)
+        x = self.input_proj(x)
         
-        # Input projection
-        x = self.input_proj(x)  # [batch, seq_len, hidden_dim]
+        # Mamba SSM processing (基於借來的代碼結構)
+        hidden_states = x
+        residual = None
         
         # Apply Mamba layers with residual connections
-        for i, mamba_layer in enumerate(self.mamba_layers):
-            residual = x
-            
-            # Apply Mamba layer
-            x = mamba_layer(x)
-            
-            # Add residual connection for deeper networks
-            if self.num_layers > 1:
-                x = self.layer_norms[i](x + residual)
-                x = self.dropout(x)
-            
-        # Final normalization and projection
-        x = self.final_norm(x)
-        x = self.output_proj(x)
+        for ssm in self.ssms:
+            hidden_states, residual = ssm(
+                hidden_states, residual, inference_params=None
+            )
         
-        return x
+        # Final residual connection and normalization (基於借來的代碼)
+        residual = (hidden_states + residual) if residual is not None else hidden_states
+        hidden_states = self.norm_fn(residual.to(dtype=self.norm_fn.weight.dtype))
+        
+        # Output projection with LeakyReLU (基於 PostNet)
+        output = self.output_proj(hidden_states)
+        
+        return output
+    
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        """
+        Allocate inference cache for each SSM layer (基於借來的代碼)
+        """
+        return {
+            i: ssm.allocate_inference_cache(
+                batch_size, max_seqlen, dtype=dtype, **kwargs
+            )
+            for i, ssm in enumerate(self.ssms)
+        }
