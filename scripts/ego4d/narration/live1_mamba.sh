@@ -16,19 +16,22 @@ ${launcher} train.py --deepspeed configs/deepspeed/zero2.json \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps $((8/$nnodes)) \
     --gradient_checkpointing True \
-    --evaluation_strategy no \
+    --eval_strategy no \
     --prediction_loss_only False \
     --save_strategy steps \
     --save_steps 500 \
-    --learning_rate 0.0002 \
+    --learning_rate 0.00002 \
     --optim adamw_torch \
     --lr_scheduler_type cosine \
-    --warmup_ratio 0.05 \
-    --logging_steps 10 \
+    --warmup_ratio 0.1 \
+    --logging_steps 5 \
     --dataloader_num_workers 16 \
     --bf16 True \
     --tf32 True \
     --report_to tensorboard \
+    --max_grad_norm 0.5 \
+    --weight_decay 0.1 \
+    --adam_epsilon 1e-08 \
     --connector_type mamba \
     --finetune_modules connector \
     --output_dir outputs/ego4d_narration_train/live1_mamba \
