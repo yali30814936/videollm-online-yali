@@ -1,7 +1,9 @@
 # import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.nn.functional as F
 # import einops
+import einops
 from mamba_ssm.models.mixer_seq_simple import create_block, _init_weights
 from functools import partial
 
@@ -47,88 +49,83 @@ def build_connector(connector_type: str, input_dim: int, hidden_dim: int, output
 
 class MambaConnector(nn.Module):
     """
-    Mamba-based connector inspired by Video_Mamba_Seq but simplified for embedding processing.
-    Based on the borrowed code structure but without PreNet, PostNet, ClsNet and pytorch_lightning.
+    Mamba-based connector for video feature processing.
+    Simplified version without PyTorch Lightning and classification components.
+    Handles SigLIP class tokens to LLaMA3 token conversion.
     """
     
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        n_ssm: int = 2,
-        **kwargs
-    ):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, n_ssm: int = 1):
         super().__init__()
-        
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.n_ssm = n_ssm
-        
-        # Input projection with non-linearity (替代 PreNet，包含 LeakyReLU)
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LeakyReLU()
+        self.pre_net = PreNet(input_dim, hidden_dim)
+        self.ssms = nn.ModuleList(
+            [create_block(hidden_dim, d_intermediate=0, layer_idx=i, ssm_cfg={"layer":"Mamba2"}) for i in range(n_ssm)]
         )
-        
-        # Mamba SSM layers (基於借來的代碼設計)
-        self.ssms = nn.ModuleList([
-            create_block(hidden_dim, d_intermediate=0, layer_idx=i) 
-            for i in range(n_ssm)
-        ])
-        
-        # Layer normalization (基於借來的代碼)
         self.norm_fn = nn.LayerNorm(hidden_dim)
+        self.post_net = PostNet(hidden_dim, output_dim)
         
-        # Output projection with non-linearity (替代 PostNet，包含 LeakyReLU)
-        self.output_proj = nn.Sequential(
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        # Initialize weights using the borrowed code's method
+        # Initialize weights
         self.apply(partial(_init_weights, n_layer=n_ssm))
     
     def forward(self, x: Tensor) -> Tensor:
         """
-        Forward pass based on Video_Mamba_Seq design but simplified.
-        
         Args:
-            x: Input tensor [batch, seq_len, input_dim]
-            
+            x: Input tensor from SigLIP class tokens
+               - Shape: (b, t, d) for class tokens per frame
         Returns:
-            Output tensor [batch, seq_len, output_dim]
+            Output tensor for LLaMA3: (b, t, output_dim)
         """
-        # Input projection with LeakyReLU (基於 PreNet)
-        x = self.input_proj(x)
         
-        # Mamba SSM processing (基於借來的代碼結構)
+        # b, t, d = x.shape
+        
+        # Reshape for pre_net processing: (b*t, d)
+        # x = einops.rearrange(x, "b t d -> (b t) d", b=b, t=t)
+        
+        # Pre-processing: input_dim -> hidden_dim
+        x = self.pre_net(x)
+        
+        # Reshape back for temporal modeling: (b, t, hidden_dim)
+        # x = einops.rearrange(x, "(b t) d -> b t d", b=b, t=t)
+        
+        # Pass through Mamba blocks for temporal modeling
         hidden_states = x
         residual = None
         
-        # Apply Mamba layers with residual connections
         for ssm in self.ssms:
-            hidden_states, residual = ssm(
-                hidden_states, residual, inference_params=None
-            )
+            hidden_states, residual = ssm(hidden_states, residual)
         
-        # Final residual connection and normalization (基於借來的代碼)
+        # Final normalization
         residual = (hidden_states + residual) if residual is not None else hidden_states
         hidden_states = self.norm_fn(residual.to(dtype=self.norm_fn.weight.dtype))
         
-        # Output projection with LeakyReLU (基於 PostNet)
-        output = self.output_proj(hidden_states)
+        # Post-processing: hidden_dim -> output_dim (for LLaMA3)
+        # x = einops.rearrange(hidden_states, "b t d -> (b t) d")
+        x = self.post_net(x)
+        # x = einops.rearrange(x, "(b t) d -> b t d", b=b, t=t)
         
-        return output
+        return x
+
+
+class PreNet(nn.Module):
+    """Preprocessing network to transform input to model dimension."""
     
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        """
-        Allocate inference cache for each SSM layer (基於借來的代碼)
-        """
-        return {
-            i: ssm.allocate_inference_cache(
-                batch_size, max_seqlen, dtype=dtype, **kwargs
-            )
-            for i, ssm in enumerate(self.ssms)
-        }
+    def __init__(self, d_input: int, d_model: int):
+        super().__init__()
+        self.fc = nn.Linear(d_input, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc(x)
+        x = F.leaky_relu(x)
+        return x
+
+
+class PostNet(nn.Module):
+    """Postprocessing network to transform model output to target dimension."""
+    
+    def __init__(self, d_model: int, d_output: int):
+        super().__init__()
+        self.fc = nn.Linear(d_model, d_output)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.leaky_relu(x)
+        x = self.fc(x)
+        return x
