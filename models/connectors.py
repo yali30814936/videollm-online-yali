@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
@@ -63,50 +62,6 @@ class MambaConnector(nn.Module):
         
         # Initialize weights
         self.apply(partial(_init_weights, n_layer=n_ssm))
-    
-    def _stable_init_weights(self):
-        """穩定的權重初始化（修復 SSM 權重過大問題）- 生產環境加強版"""
-        # 標準初始化
-        self.apply(partial(_init_weights, n_layer=self.n_ssm))
-        
-        # 對 SSM 層進行超保守處理（生產環境加強）
-        for i, ssm in enumerate(self.ssms):
-            # 進一步降低 A_log 的初始值（原來範數 >300，現在 <0.1）
-            if hasattr(ssm.mixer, 'A_log'):
-                with torch.no_grad():
-                    # 使用極小的初始化範圍
-                    ssm.mixer.A_log.data = torch.randn_like(ssm.mixer.A_log.data) * 0.001
-                    # 確保在極小範圍內
-                    ssm.mixer.A_log.data.clamp_(-0.01, 0.01)
-            
-            # 進一步降低 dt_proj 的 bias（原來範數 >180，現在 <0.01）
-            if hasattr(ssm.mixer, 'dt_proj') and hasattr(ssm.mixer.dt_proj, 'bias'):
-                if ssm.mixer.dt_proj.bias is not None:
-                    with torch.no_grad():
-                        ssm.mixer.dt_proj.bias.data = torch.randn_like(ssm.mixer.dt_proj.bias.data) * 0.0001
-                        # 限制在極小範圍
-                        ssm.mixer.dt_proj.bias.data.clamp_(-0.001, 0.001)
-            
-            # 對 D 參數進行特殊處理（如果存在）
-            if hasattr(ssm.mixer, 'D'):
-                with torch.no_grad():
-                    ssm.mixer.D.data = torch.ones_like(ssm.mixer.D.data) * 0.1
-            
-            # 對其他線性層使用更保守的初始化
-            for name, module in ssm.named_modules():
-                if isinstance(module, nn.Linear):
-                    # 使用更小的Xavier初始化
-                    nn.init.xavier_uniform_(module.weight, gain=0.1)
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-        
-        # 對輸入和輸出投影使用保守初始化
-        for module in [self.input_proj, self.output_proj]:
-            for m in module.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.5)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
     
     def forward(self, x: Tensor) -> Tensor:
         """
