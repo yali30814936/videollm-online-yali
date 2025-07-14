@@ -2,8 +2,6 @@
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-# import einops
-import einops
 from mamba_ssm.models.mixer_seq_simple import create_block, _init_weights
 from functools import partial
 
@@ -74,17 +72,8 @@ class MambaConnector(nn.Module):
         Returns:
             Output tensor for LLaMA3: (b, t, output_dim)
         """
-        
-        # b, t, d = x.shape
-        
-        # Reshape for pre_net processing: (b*t, d)
-        # x = einops.rearrange(x, "b t d -> (b t) d", b=b, t=t)
-        
-        # Pre-processing: input_dim -> hidden_dim
+        # Preprocessing: input_dim -> hidden_dim
         x = self.pre_net(x)
-        
-        # Reshape back for temporal modeling: (b, t, hidden_dim)
-        # x = einops.rearrange(x, "(b t) d -> b t d", b=b, t=t)
         
         # Pass through Mamba blocks for temporal modeling
         hidden_states = x
@@ -97,10 +86,7 @@ class MambaConnector(nn.Module):
         residual = (hidden_states + residual) if residual is not None else hidden_states
         hidden_states = self.norm_fn(residual.to(dtype=self.norm_fn.weight.dtype))
         
-        # Post-processing: hidden_dim -> output_dim (for LLaMA3)
-        # x = einops.rearrange(hidden_states, "b t d -> (b t) d")
         x = self.post_net(x)
-        # x = einops.rearrange(x, "(b t) d -> b t d", b=b, t=t)
         
         return x
 
