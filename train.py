@@ -21,7 +21,7 @@ def train():
         data_collator=data_collator,
         compute_metrics=compute_metrics_dict,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
 
     if eval_dataset_dict is not None:
