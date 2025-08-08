@@ -33,7 +33,7 @@ if __name__ == "__main__":
         slurm_partition=args.slurm_partition,
         mem_gb=240,
         slurm_time='24:00:00',
-        timeout_min=600,
+        timeout_min=1440,
     )
     job = executor.submit(task)
     job.results()

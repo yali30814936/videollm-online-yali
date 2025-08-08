@@ -1,7 +1,7 @@
 import random, torch, tqdm, os, subprocess, torchvision, pathlib, submitit, math
 from itertools import takewhile
 try:
-    torchvision.set_video_backend('video_reader')
+    torchvision.set_video_backend('pyav')
 except:
     pass
 from transformers import AutoModel
@@ -56,7 +56,7 @@ def ffmpeg_once(src_path: str, dst_path: str, *, fps: int = None, resolution: in
         '-sws_flags', mode,
         '-i', src_path,
         '-an',
-        '-threads', '10',
+        '-threads', '10'
     ]
     if fps is not None:
         command += ['-r', str(fps)]
@@ -76,19 +76,24 @@ def distributed_ffmpeg(*, src_root: str, fps: int = None, resolution: int = None
         dst_root += f'_{fps}fps'
     if resolution is not None:
         assert (pad is not None)
-        dst_root += f'_max{resolution}'
+        dst_root += f'_{resolution}'
+    skipped = 0
     for i, src_path in tqdm.tqdm(enumerate(src_paths), desc=f'{src_root} -> {dst_root}'):
         if i % env.num_tasks != env.global_rank:
             continue
         dst_path = src_path.replace(src_root, dst_root)
+        if os.path.exists(dst_path):
+            skipped += 1
+            continue
         ffmpeg_once(src_path, dst_path, fps=fps, resolution=resolution, pad=pad, mode=mode)
+    print(f"Skipped {skipped} files.")
 
 def distributed_encode(*, src_root: str, vision_pretrained: str, vision_encode: callable, batch_size: int, embed_mark: str, save_bf16: bool = False, **kwargs):
     env = submitit.JobEnvironment()
     src_root = src_root.rstrip('/')
     model = AutoModel.from_pretrained(vision_pretrained, device_map=f'cuda:{env.local_rank}').vision_model
     model.eval()
-    dst_root = f"{src_root}_{embed_mark.split('_')[-1]}_{vision_pretrained.replace('/', '--')}"
+    dst_root = f"{src_root.replace('2fps', '1fps')}_{embed_mark.split('_')[-1]}_{vision_pretrained.replace('/', '--')}"
     os.makedirs(dst_root, exist_ok=True)
     for i, file in tqdm.tqdm(enumerate(os.listdir(src_root)), desc=f'{src_root} -> {dst_root}'):
         if i % env.num_tasks != env.global_rank:
@@ -96,7 +101,10 @@ def distributed_encode(*, src_root: str, vision_pretrained: str, vision_encode: 
         frame_path = os.path.join(src_root, file)
         save_path = os.path.splitext(frame_path)[0] + '.pt'
         save_path = save_path.replace(src_root, dst_root)
+        if os.path.exists(save_path):
+            continue
         frames = torchvision.io.read_video(frame_path, pts_unit='sec', output_format='TCHW')[0]
+        frames = frames[::2]
         with torch.no_grad():
             frames = torch.cat([vision_encode(model, batch.to(f'cuda:{env.local_rank}')).cpu() for batch in frames.split(batch_size)])
         if save_bf16:

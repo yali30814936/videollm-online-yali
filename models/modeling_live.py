@@ -1,4 +1,5 @@
 import torch, os
+from typing import Optional
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, Cache
 from transformers.utils import logging
@@ -17,6 +18,9 @@ class LiveMixin(AutoModelForCausalLM):
     def unset_vision_inside(self):
         del self.vision_encoder
         del self.vision_encode
+    
+    def get_input_embeddings(self):
+        return self.llm.get_input_embeddings()
 
     def visual_embed(self, frames: torch.Tensor):
         if hasattr(self, 'vision_encode'):
@@ -170,15 +174,17 @@ class LiveMixin(AutoModelForCausalLM):
     def trim_past_key_values(self, past_key_values, start, stop):
         return [[past_keys[:,:,start:stop], past_values[:,:,start:stop]] for past_keys, past_values in past_key_values]
 
-def fast_greedy_generate(*, model: LiveMixin, inputs_embeds: torch.Tensor, past_key_values: Cache, eos_token_id: int, inplace_output_ids: torch.Tensor):
+def fast_greedy_generate(*, model: LiveMixin, inputs_embeds: torch.Tensor, past_key_values: Cache, eos_token_id: int, inplace_output_ids: torch.Tensor, v_mask: Optional[torch.Tensor] = None, frame_interval_mask: Optional[torch.Tensor] = None):
     for i in range(inplace_output_ids.size(1)):
-        outputs = model(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
+        outputs = model(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True, v_mask=v_mask, frame_interval_mask=frame_interval_mask)
         past_key_values = outputs.past_key_values
         new_token_id = outputs.logits[:, -1:].argmax(dim=-1)
         inplace_output_ids[:, i] = new_token_id
         if new_token_id == eos_token_id:
             break
         inputs_embeds = model.get_input_embeddings()(new_token_id)
+        v_mask = torch.zeros((1, new_token_id.shape[1]), device='cuda', dtype=torch.bool)
+        frame_interval_mask = torch.zeros_like(v_mask, device='cuda', dtype=torch.bool)
     return inplace_output_ids[:, :i+1], past_key_values
 
 def build_live(
@@ -211,7 +217,7 @@ def build_live(
                 target_modules=lora_modules,
                 lora_dropout=0.05,
                 task_type="CAUSAL_LM",
-                modules_to_save=[],  # Empty for MLP
+                modules_to_save=finetune_modules,
                 inference_mode=False,
             )
             model = get_peft_model(model, lora_config)

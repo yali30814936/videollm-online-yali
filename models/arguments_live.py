@@ -17,16 +17,20 @@ class LiveTrainingArguments(TrainingArguments):
     lora_r: int = 128
     lora_alpha: int = 256
     finetune_modules: list[str] = field(default_factory=lambda: ['connector'])
-    connector_type: str = 'mamba'  # 'mlp' or 'mamba'
+    connector_type: str = 'mlp'  # 'mlp' or 'mamba'
     frame_fps: int = 2 # for training. inference can be 10
     frame_token_cls: bool = None
     frame_token_pooled: list[int] = None
     frame_resolution: int = 384
-    frame_token_interval: str  = None
+    frame_token_interval: str  = ','
     frame_token_interval_threshold: float = 0.0
     augmentation: bool = False
     attn_implementation: str = 'flash_attention_2'
     output_dir: str = 'outputs/debug'
+    vision_drop_strategy: str = None
+    is_mod_weighted: bool = True
+    mod_warmup_steps: int = 0
+    is_return_vision_weights: bool = False
 
 @dataclass
 class LiveOneTrainingArguments(LiveTrainingArguments):
@@ -41,9 +45,10 @@ class LiveOneTrainingArguments(LiveTrainingArguments):
 class LiveOnePlusTrainingArguments(LiveTrainingArguments):
     live_version: str = 'live1+'
     frame_token_cls: bool = True
-    frame_token_pooled: list[int] = field(default_factory=lambda: [3,3])
-    frame_num_tokens: int = 10 # 1+3x3
-    embed_mark: str = '2fps_384_1+3x3'
+    frame_token_pooled: list[int] = field(default_factory=lambda: [2, 2])
+    frame_num_tokens: int = 5 # 1+2x2
+    frame_fps: int = 2
+    embed_mark: str = '2fps_384_1+2x2'
     frame_token_interval: str = ','
     max_num_frames: int = 1200 # 10min, 2fps, 1200 frames
 

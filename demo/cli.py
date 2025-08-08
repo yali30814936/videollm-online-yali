@@ -1,6 +1,6 @@
 import os, torchvision, transformers, tqdm, time, json
 import torch.multiprocessing as mp
-torchvision.set_video_backend('video_reader')
+torchvision.set_video_backend('pyav')
 
 from data.utils import ffmpeg_once
 
@@ -10,6 +10,7 @@ logger = transformers.logging.get_logger('liveinfer')
 # python -m demo.cli --resume_from_checkpoint ... 
 
 def main(liveinfer: LiveInfer):
+    # src_video_path = 'datasets/ego4d/v2/full_scale/ec4b530e-f01c-420a-915d-4a11bc26c3ae.mp4'
     src_video_path = 'demo/assets/cooking.mp4'
     name, ext = os.path.splitext(src_video_path)
     ffmpeg_video_path = os.path.join('demo/assets/cache', name + f'_{liveinfer.frame_fps}fps_{liveinfer.frame_resolution}' + ext)
@@ -28,7 +29,7 @@ def main(liveinfer: LiveInfer):
     timecosts = []
     pbar = tqdm.tqdm(total=liveinfer.num_video_frames, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}]")
     history = {'video_path': src_video_path, 'frame_fps': liveinfer.frame_fps, 'conversation': []} 
-    for i in range(100):
+    for i in range(min(liveinfer.num_video_frames, 10000)):
         # liveinfer.frame_token_interval_threshold -= 0.00175 # decay
         start_time = time.time()
         liveinfer.input_video_stream(i / liveinfer.frame_fps)

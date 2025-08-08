@@ -44,7 +44,18 @@ class LiveInfer:
             assert self.last_ids == 933, f'{self.last_ids} != 933' # HACK, 933 = ]\n
             self.last_ids = self._added_stream_generation_ids
         inputs_embeds = self.model.get_input_embeddings()(self.last_ids)
-        output_ids, self.past_key_values = fast_greedy_generate(model=self.model, inputs_embeds=inputs_embeds, past_key_values=self.past_key_values, eos_token_id=self.eos_token_id, inplace_output_ids=self.inplace_output_ids)
+        v_mask = torch.zeros((1, self.last_ids.shape[1]), device='cuda', dtype=torch.bool)
+        frame_interval_mask = self.last_ids == self.frame_token_interval_id
+        print(v_mask.shape, frame_interval_mask.shape, inputs_embeds.shape, self.last_ids.shape)
+        output_ids, self.past_key_values = fast_greedy_generate(
+            model=self.model,
+            inputs_embeds=inputs_embeds,
+            past_key_values=self.past_key_values,
+            eos_token_id=self.eos_token_id,
+            inplace_output_ids=self.inplace_output_ids,
+            v_mask=v_mask,
+            frame_interval_mask=frame_interval_mask
+        )
         self.last_ids = output_ids[:, -1:]
         if query:
             query = f'(Video Time = {video_time}s) User: {query}'
@@ -66,7 +77,15 @@ class LiveInfer:
                 self.model.get_input_embeddings()(self.last_ids).view(1, -1, self.hidden_size),
                 frame_embeds.view(1, -1, self.hidden_size),
             ], dim=1)
-            outputs = self.model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=self.past_key_values)
+            v_mask = torch.cat([
+                torch.zeros((1, self.last_ids.shape[1]), device='cuda', dtype=torch.bool),
+                torch.ones((1, frame_embeds.shape[0]), device='cuda', dtype=torch.bool)
+            ], dim=1)
+            frame_interval_mask = torch.cat([
+                self.last_ids == self.frame_token_interval_id,
+                torch.zeros((1, frame_embeds.shape[0]), device='cuda', dtype=torch.bool)
+            ], dim=1)
+            outputs = self.model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=self.past_key_values, v_mask=v_mask, frame_interval_mask=frame_interval_mask)
             self.past_key_values = outputs.past_key_values
             # 2. if the same time, response after frame at that time
             if self.query_queue and video_time >= self.query_queue[0][0]:
