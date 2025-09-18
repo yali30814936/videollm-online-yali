@@ -1,11 +1,12 @@
 from transformers import PretrainedConfig
+from typing import Optional, List
 
 class LiveConfigMixin(PretrainedConfig):
-    def __init__(self, *, vision_pretrained: str = None,
-        frame_resolution: int = None, frame_token_cls: bool = None, frame_token_pooled: list[int] = None, frame_num_tokens: int = None,
-        v_placeholder: str = '<v>', frame_token_interval: str = None, v_placeholder_id: int = None, frame_token_interval_id: int = None,
+    def __init__(self, *, vision_pretrained: Optional[str] = None,
+        frame_resolution: Optional[int] = None, frame_token_cls: Optional[bool] = None, frame_token_pooled: Optional[List[int]] = None, frame_num_tokens: Optional[int] = None,
+        v_placeholder: str = '<v>', frame_token_interval: Optional[str] = None, v_placeholder_id: Optional[int] = None, frame_token_interval_id: Optional[int] = None,
         stream_loss_weight: float = 1.0,
-        vision_drop_strategy: str = None, is_mod_weighted: bool = True, mod_warmup_steps: int = 0, is_return_vision_weights: bool = True, vision_hidden_size=1024, connector_type: str = 'mlp', **kwargs
+        vision_drop_strategy: Optional[str] = None, is_mod_weighted: bool = True, mod_warmup_steps: int = 0, is_return_vision_weights: bool = True, vision_hidden_size=1024, connector_type: str = 'mlp', **kwargs
     ):
         super().__init__(**kwargs)
         self.vision_pretrained = vision_pretrained

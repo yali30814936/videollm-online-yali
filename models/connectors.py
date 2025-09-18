@@ -1,7 +1,6 @@
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-from mamba_ssm.models.mixer_seq_simple import create_block, _init_weights
 from functools import partial
 
 
@@ -53,6 +52,16 @@ class MambaConnector(nn.Module):
     
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, n_ssm: int = 1):
         super().__init__()
+        
+        # Import mamba_ssm only when MambaConnector is actually used
+        try:
+            from mamba_ssm.models.mixer_seq_simple import create_block, _init_weights
+        except ImportError:
+            raise ImportError(
+                "mamba-ssm is required for MambaConnector. "
+                "Please install it with: pip install mamba-ssm"
+            )
+        
         self.pre_net = PreNet(input_dim, hidden_dim)
         self.ssms = nn.ModuleList(
             [create_block(hidden_dim, d_intermediate=0, layer_idx=i, ssm_cfg={"layer":"Mamba2"}) for i in range(n_ssm)]

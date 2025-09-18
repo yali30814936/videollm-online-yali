@@ -9,9 +9,35 @@ logger = transformers.logging.get_logger('liveinfer')
 
 # python -m demo.cli --resume_from_checkpoint ... 
 
-def main(liveinfer: LiveInfer):
-    # src_video_path = 'datasets/ego4d/v2/full_scale/ec4b530e-f01c-420a-915d-4a11bc26c3ae.mp4'
-    src_video_path = 'demo/assets/cooking.mp4'
+def main(liveinfer):
+    # Optional: configure memory trim via env for testing
+    import os
+    mode = os.getenv('LIVE_TRIM_MODE')
+    if mode in ('hybrid', 'frames_only'):
+        try:
+            liveinfer.set_memory_trim_mode(mode)
+            logger.warning(f'[CLI] Memory trim mode set to: {mode}')
+        except Exception:
+            pass
+    trig = os.getenv('LIVE_TRIM_TRIGGER')
+    if trig and trig.isdigit():
+        try:
+            liveinfer.memory_trim_trigger = int(trig)
+            logger.warning(f'[CLI] Memory trim trigger set to: {liveinfer.memory_trim_trigger}')
+        except Exception:
+            pass
+    # src_video_path = 'datasets/ego4d/v2/full_scale/1cfcca5d-7c45-46e3-8f2e-90b6d9bcf04c.mp4' # drum
+    # src_video_path = 'datasets/ego4d/v2/full_scale/ec4b530e-f01c-420a-915d-4a11bc26c3ae.mp4' # long video (val)
+    src_video_path = 'datasets/ego4d/v2/full_scale/de493aa9-e00c-4c54-bd8b-304e94291ba2.mp4' # long video (?)
+    # src_video_path = 'datasets/ego4d/v2/full_scale/0c190d90-8230-42c8-b574-5ff9d513ecaf.mp4' # crossing street
+    # src_video_path = 'datasets/ego4d/v2/full_scale/7b8c29ef-fcb6-4a9d-9b99-0e6bb64eadb9.mp4' # dinning room
+    # src_video_path = 'datasets/ego4d/v2/full_scale/9ff8c35c-bd28-436f-b35b-ee460f983a67.mp4' # driving
+    # src_video_path = 'datasets/ego4d/v2/full_scale/73f567d0-7f65-4f33-9331-59936ef97f7a.mp4' # guitar
+    # src_video_path = 'datasets/ego4d/v2/full_scale/194612d8-4baa-4e08-a382-158974395e45.mp4' # mall
+    # src_video_path = 'datasets/ego4d/v2/full_scale/9439167f-026f-4188-a671-96f068000fd3.mp4' # construction site
+    
+    # src_video_path = 'demo/assets/bicycle.mp4'
+    # src_video_path = 'demo/assets/cooking.mp4'
     name, ext = os.path.splitext(src_video_path)
     ffmpeg_video_path = os.path.join('demo/assets/cache', name + f'_{liveinfer.frame_fps}fps_{liveinfer.frame_resolution}' + ext)
     save_history_path = src_video_path.replace('.mp4', '.json')
@@ -45,6 +71,17 @@ def main(liveinfer: LiveInfer):
         if response:
             history['conversation'].append({'role': 'assistant', 'content': response, 'time': liveinfer.video_time, 'fps': fps, 'cost': timecosts[-1]})
             print(response)
+        # Optional: print full/cropped chat snapshot for debugging when enabled
+        if os.getenv('LIVE_DEBUG_CHAT') == '1':
+            try:
+                liveinfer.debug_print_full_chat()
+            except Exception:
+                pass
+        if os.getenv('LIVE_DEBUG_CROPPED_CHAT') == '1':
+            try:
+                liveinfer.debug_print_cropped_chat()
+            except Exception:
+                pass
         if not query and not response:
             history['conversation'].append({'time': liveinfer.video_time, 'fps': fps, 'cost': timecosts[-1]})
     json.dump(history, open(save_history_path, 'w'), indent=4)
