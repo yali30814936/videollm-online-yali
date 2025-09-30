@@ -55,7 +55,7 @@ def main(liveinfer):
     timecosts = []
     pbar = tqdm.tqdm(total=liveinfer.num_video_frames, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}{postfix}]")
     history = {'video_path': src_video_path, 'frame_fps': liveinfer.frame_fps, 'conversation': []} 
-    for i in range(min(liveinfer.num_video_frames, 10000)):
+    for i in range(liveinfer.num_video_frames):
         # liveinfer.frame_token_interval_threshold -= 0.00175 # decay
         start_time = time.time()
         liveinfer.input_video_stream(i / liveinfer.frame_fps)

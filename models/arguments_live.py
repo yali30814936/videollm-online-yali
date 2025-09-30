@@ -23,7 +23,7 @@ class LiveTrainingArguments(TrainingArguments):
     frame_token_pooled: list[int] = None
     frame_resolution: int = 384
     frame_token_interval: str  = ','
-    frame_token_interval_threshold: float = 0.0
+    frame_token_interval_threshold: float = 0.725
     augmentation: bool = False
     attn_implementation: str = 'flash_attention_2'
     output_dir: str = 'outputs/debug'
@@ -31,6 +31,8 @@ class LiveTrainingArguments(TrainingArguments):
     is_mod_weighted: bool = True
     mod_warmup_steps: int = 0
     is_return_vision_weights: bool = False
+    use_conversation_eval: bool = False
+    eval_text_metrics: list[str] = field(default_factory=lambda: ['rougelsum', 'meteor'])
 
 @dataclass
 class LiveOneTrainingArguments(LiveTrainingArguments):
@@ -46,7 +48,7 @@ class LiveOnePlusTrainingArguments(LiveTrainingArguments):
     live_version: str = 'live1+'
     frame_token_cls: bool = True
     frame_token_pooled: list[int] = field(default_factory=lambda: [2, 2])
-    frame_num_tokens: int = 5 # 1+2x2
+    frame_num_tokens: int = 5
     frame_fps: int = 2
     embed_mark: str = '2fps_384_1+2x2'
     frame_token_interval: str = ','

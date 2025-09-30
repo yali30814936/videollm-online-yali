@@ -1,7 +1,8 @@
-import torch, os
-from typing import Optional
+import torch, re
+from collections import deque
+from typing import Optional, Any
 from peft import LoraConfig, get_peft_model, PeftModel
-from transformers import AutoModelForCausalLM, Cache
+from transformers import AutoModelForCausalLM, Cache, PreTrainedTokenizer
 from transformers.utils import logging
 
 from .tokenization_live import build_live_tokenizer_and_update_config
@@ -174,17 +175,367 @@ class LiveMixin(AutoModelForCausalLM):
     def trim_past_key_values(self, past_key_values, start, stop):
         return [[past_keys[:,:,start:stop], past_values[:,:,start:stop]] for past_keys, past_values in past_key_values]
 
-def fast_greedy_generate(*, model: LiveMixin, inputs_embeds: torch.Tensor, past_key_values: Cache, eos_token_id: int, inplace_output_ids: torch.Tensor, v_mask: Optional[torch.Tensor] = None, frame_interval_mask: Optional[torch.Tensor] = None):
+    @torch.no_grad()
+    def conversation_stream_evaluate(
+        self,
+        frames: torch.Tensor,
+        conversations: list,
+        tokenizer: PreTrainedTokenizer,
+        frame_token_interval_threshold: float = 0.725,
+        max_new_tokens: int = 100,
+        **kwargs
+    ):
+        device = frames.device
+        conversations = conversations[0]
+        state = self._init_simulation_state(device, frame_token_interval_threshold, max_new_tokens, tokenizer)
+
+        query_queue = deque()
+        gt_responses = []
+        pd_responses = []
+
+        # Prepare for response generation
+        fid = 0
+        for conv in conversations:
+            if conv['role'] == 'system' or conv['role'] == 'user':
+                query_queue.append((fid, conv))
+            elif conv['role'] == 'assistant':
+                gt_responses.append((fid, conv))
+            elif conv['role'] == 'stream':
+                fid += conv['num_frames']
+
+        # Process frames
+        last_role = None
+        for fid, frame in enumerate(frames):
+            turn_conversations = []
+            while query_queue and query_queue[0][0] == fid:
+                _, conv = query_queue.popleft()
+                turn_conversations.append(conv)
+            if turn_conversations:
+                state['last_ids'] = tokenizer.apply_chat_template(
+                    turn_conversations,
+                    add_stream_query_prompt=(last_role == 'stream'),
+                    add_generation_prompt=(turn_conversations[-1]['role'] == 'user'),
+                    add_stream_prompt=(turn_conversations[-1]['role'] != 'user'),
+                    add_stream_generation_prompt=False,
+                    return_tensors='pt'
+                ).to(device)
+                last_role = turn_conversations[-1]['role']
+            elif last_role == 'assistant':
+                state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
+            
+            if last_role == 'user':
+                output_ids = self._simulate_stream_response(state=state, device=device)
+                pd_responses.append((fid, {
+                    'role': 'assistant',
+                    'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
+                }))
+                last_role = 'assistant'
+                state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
+                
+            next_token = self._simulate_stream_step(state, frame)
+            last_role = 'stream'
+            if next_token == 933: #]\n
+                state['last_ids'] = state['_added_stream_generation_ids'].to(device)
+                output_ids = self._simulate_stream_response(state=state, device=device)
+                pd_responses.append((fid, {
+                    'role': 'assistant',
+                    'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
+                }))
+                last_role = 'assistant'
+
+        return self._evaluate_responses(pd_responses, gt_responses)
+        # return torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=torch.float32, device=device)
+
+    def _simulate_stream_step(self, state, frame):
+        device = state['device']
+        
+        input_embeds = torch.cat([
+            self.get_input_embeddings()(state['last_ids'].to(device)),
+            self.visual_embed(frame).view(1, -1, self.config.hidden_size)
+        ], dim=1)
+        v_mask = torch.cat([
+            torch.zeros((1, state['last_ids'].size(1)), dtype=torch.bool, device=device),
+            torch.ones((1, self.config.frame_num_tokens), dtype=torch.bool, device=device)
+        ], dim=1)
+        frame_interval_mask = torch.cat([
+            state['last_ids'] == self.config.frame_token_interval_id,
+            torch.zeros((1, self.config.frame_num_tokens), dtype=torch.bool, device=device)
+        ], dim=1)
+        
+        outputs = self.forward(
+            inputs_embeds = input_embeds,
+            v_mask = v_mask,
+            frame_interval_mask = frame_interval_mask,
+            past_key_values = state.get('past_key_values', None),
+            return_dict = True,
+            use_cache = True
+        )
+        
+        state['past_key_values'] = outputs.past_key_values
+
+        next_score = outputs.logits[:,-1:].softmax(dim=-1)
+        if next_score[:,:,self.config.frame_token_interval_id] < self.config.frame_token_interval_threshold:
+            next_score[:,:,self.config.frame_token_interval_id].zero_()
+        next_token = next_score.argmax(dim=-1)
+        state['last_ids'] = next_token
+        return next_token
+
+    def _simulate_stream_response(self, state, device):
+        eos_token_id = self.config.eos_token_id
+        
+        input_embeds = self.get_input_embeddings()(state['last_ids'].to(device))
+        v_mask = torch.zeros((1, state['last_ids'].size(1)), dtype=torch.bool, device=device)
+        frame_interval_mask = state['last_ids'] == self.config.frame_token_interval_id
+        
+        output_ids, state['past_key_values'] = fast_greedy_generate(
+            model=self,
+            inputs_embeds=input_embeds,
+            past_key_values=state.get('past_key_values', None),
+            v_mask=v_mask,
+            frame_interval_mask=frame_interval_mask,
+            eos_token_id=eos_token_id,
+            inplace_output_ids=state['inplace_output_ids'],
+            device=device
+        )
+        
+        state['last_ids'] = output_ids[:,-1:]
+        return output_ids
+        
+    def _get_stream_token_templates(self, tokenizer):
+        """預計算流式處理所需的token模板，類似 LiveInfer 的初始化"""
+        if tokenizer is None:
+            # 如果沒有tokenizer，返回佔位符
+            return {
+                '_added_stream_prompt_ids': torch.tensor([[]], dtype=torch.long),
+                '_added_stream_generation_ids': torch.tensor([[]], dtype=torch.long),
+            }
+            
+        # 計算各種模板token序列
+        _added_stream_prompt_ids = tokenizer.apply_chat_template(
+            [{}], 
+            add_stream_prompt=True, 
+            return_tensors='pt'
+        )
+        _added_stream_generation_ids = tokenizer.apply_chat_template(
+            [{}], 
+            add_stream_generation_prompt=True, 
+            return_tensors='pt'
+        )
+        
+        return {
+            '_added_stream_prompt_ids': _added_stream_prompt_ids,
+            '_added_stream_generation_ids': _added_stream_generation_ids,
+        }
+
+    def _init_simulation_state(self, device, frame_token_interval_threshold, max_new_tokens, tokenizer=None):
+        """初始化模擬狀態，類似 LiveInfer 的初始化"""
+        # 獲取流式處理的token模板
+        stream_templates = self._get_stream_token_templates(tokenizer)
+        
+        # 將模板移動到正確的設備
+        for key, value in stream_templates.items():
+            if isinstance(value, torch.Tensor):
+                stream_templates[key] = value.to(device)
+        
+        state = {
+            'device': device,
+            'past_key_values': None,
+            'last_ids': torch.tensor([[]], device=device, dtype=torch.long),
+            'inplace_output_ids': torch.zeros((1, max_new_tokens), dtype=torch.long, device=device),
+            'max_new_tokens': max_new_tokens,
+        }
+        
+        # 合併流式處理模板
+        state.update(stream_templates)
+        return state
+
+    def _evaluate_responses(self, pd_responses, gt_responses):
+        """
+        使用匈牙利演算法（最小化 |Δframe|）將預測與標註配對，並計算：
+        - time_mae: 平均時間誤差（秒），由 |Δframe| / fps 換算
+        - time_acc: 時間誤差在 3 幀（= 3/fps 秒）以內的比例
+        - text_sim: 文本相似度（預設 ROUGE-Lsum F1，可透過 self.config.eval_text_metric == 'meteor' 改用 METEOR），匹配對取平均
+        - f1: 事件級配對的 F1（匹配數與預測/標註數量的調和平均）
+
+        回傳: torch.float32 tensor [time_mae(sec), time_acc(<=3/fps s), text_sim, f1]
+        """
+
+        # 文本相似度：支援多種度量，依 self.config.eval_text_metrics（list/tuple/逗號字串）決定
+        # 若未指定，退回 self.config.eval_text_metric 或預設 rougeLsum
+        def _normalize_metric_name(name: str) -> str:
+            n = name.strip().lower()
+            if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
+                return 'rougelsum'
+            if n in ('meteor',):
+                return 'meteor'
+            if n in ('jaccard', 'jac'):  # 明確 jaccard
+                return 'jaccard'
+            return n
+
+        text_metrics_raw = getattr(self.config, 'eval_text_metrics', None)
+        if text_metrics_raw is None:
+            single_metric = getattr(self.config, 'eval_text_metric', 'rougeLsum')
+            if isinstance(single_metric, str) and ',' in single_metric:
+                text_metric_list = [m for m in single_metric.split(',') if m.strip()]
+            else:
+                text_metric_list = [single_metric]
+        else:
+            if isinstance(text_metrics_raw, str):
+                text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
+            else:
+                text_metric_list = list(text_metrics_raw)
+        text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
+        if not text_metric_list:
+            text_metric_list = ['rougelsum']
+
+        # 提取 frame index 與文本
+        pd_fids = [fid for fid, _ in pd_responses]
+        gt_fids = [fid for fid, _ in gt_responses]
+        pd_texts = [res[1].get('content', '') for res in pd_responses]
+        gt_texts = [res[1].get('content', '') for res in gt_responses]
+
+        n_pred, n_gt = len(pd_fids), len(gt_fids)
+        if n_pred == 0 and n_gt == 0:
+            # 無事件：時間 MAE=0, time_acc=1, 每個文字指標=1, F1=1
+            out_vec = [0.0, 1.0] + [1.0] * len(text_metric_list) + [1.0]
+            return torch.tensor(out_vec, dtype=torch.float32)
+        if n_pred == 0 or n_gt == 0:
+            # 單邊空：全部 0（除了時間 MAE=0）
+            out_vec = [0.0, 0.0] + [0.0] * len(text_metric_list) + [0.0]
+            return torch.tensor(out_vec, dtype=torch.float32)
+
+        # 構建成本矩陣（L1 差值 on frames）
+        cost = [[abs(pi - gi) for gi in gt_fids] for pi in pd_fids]
+
+        # 使用 SciPy 匈牙利匹配；若失敗則退化為排序配對
+        try:
+            from scipy.optimize import linear_sum_assignment  # type: ignore
+            import numpy as np
+            cmat = np.array(cost, dtype=float)
+            rows, cols = linear_sum_assignment(cmat)
+            rows, cols = rows.tolist(), cols.tolist()
+        except Exception:
+            pd_sorted = sorted(range(n_pred), key=lambda i: pd_fids[i])
+            gt_sorted = sorted(range(n_gt), key=lambda j: gt_fids[j])
+            k = min(n_pred, n_gt)
+            rows, cols = pd_sorted[:k], gt_sorted[:k]
+
+        need_meteor = any(m == 'meteor' for m in text_metric_list)
+        need_rouge = any(m == 'rougelsum' for m in text_metric_list)
+
+        meteor_fn = None
+        rouge_scorer = None
+        if need_meteor:
+            try:
+                from nltk.translate.meteor_score import meteor_score  # type: ignore
+                meteor_fn = meteor_score
+            except Exception:
+                meteor_fn = None
+        if need_rouge:
+            try:
+                from rouge_score.rouge_scorer import RougeScorer  # type: ignore
+                rouge_scorer = RougeScorer(['rougeLsum'], use_stemmer=False)
+            except Exception:
+                rouge_scorer = None
+
+        def _jaccard(hyp: str, ref: str) -> float:
+            a = set([t for t in re.split(r"[^\w]+", (hyp or '').lower()) if t])
+            b = set([t for t in re.split(r"[^\w]+", (ref or '').lower()) if t])
+            if not a and not b:
+                return 1.0
+            inter = len(a & b)
+            union = len(a | b)
+            return inter / union if union > 0 else 0.0
+
+        def compute_text_sims(hyp: str, ref: str) -> list[float]:
+            sims: list[float] = []
+            for m in text_metric_list:
+                if m == 'meteor':
+                    if meteor_fn is not None:
+                        try:
+                            sims.append(float(meteor_fn([ref or ''], hyp or '')))
+                            continue
+                        except Exception:
+                            pass
+                    # fallback
+                    sims.append(_jaccard(hyp, ref))
+                elif m == 'rougelsum':
+                    if rouge_scorer is not None:
+                        try:
+                            score = rouge_scorer.score(ref or '', hyp or '')
+                            sims.append(float(score['rougeLsum'].fmeasure))
+                            continue
+                        except Exception:
+                            pass
+                    sims.append(_jaccard(hyp, ref))
+                elif m == 'jaccard':
+                    sims.append(_jaccard(hyp, ref))
+                else:
+                    # 未知名稱：退回 Jaccard
+                    sims.append(_jaccard(hyp, ref))
+            return sims
+
+        # 匹配後計算指標
+        abs_diffs_frames = []
+        text_sims_all: list[list[float]] = []
+        for pi, gi in zip(rows, cols):
+            abs_diffs_frames.append(abs(pd_fids[pi] - gt_fids[gi]))
+            text_sims_all.append(compute_text_sims(pd_texts[pi], gt_texts[gi]))
+
+        matched = len(abs_diffs_frames)
+        fps = float(getattr(self.config, 'frame_fps', 2) or 2)
+        fps = fps if fps > 0 else 1e-6
+        diffs_sec = [d / fps for d in abs_diffs_frames]
+        time_mae = float(sum(diffs_sec) / matched) if matched > 0 else 0.0
+        tol_sec = 3.0 / fps
+        time_acc = float(sum(1 for s in diffs_sec if s <= tol_sec) / matched) if matched > 0 else 0.0
+        # 逐指標平均
+        if matched > 0:
+            sums = [0.0] * len(text_metric_list)
+            for sims in text_sims_all:
+                for i, v in enumerate(sims):
+                    sums[i] += float(v)
+            text_avgs = [s / matched for s in sums]
+        else:
+            text_avgs = [0.0] * len(text_metric_list)
+
+        precision = matched / n_pred if n_pred > 0 else 0.0
+        recall = matched / n_gt if n_gt > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        out_vec = [time_mae, time_acc] + text_avgs + [f1]
+        # 在模型裝置上建立結果，避免分散式蒐集報 CUDA/dense 錯誤
+        try:
+            model_device = next(self.parameters()).device
+        except Exception:
+            model_device = None
+        if model_device is not None:
+            return torch.tensor(out_vec, dtype=torch.float32, device=model_device)
+        return torch.tensor(out_vec, dtype=torch.float32)
+
+def fast_greedy_generate(
+    *,
+    model: LiveMixin,
+    inputs_embeds: torch.Tensor,
+    past_key_values: Cache,
+    eos_token_id: int,
+    inplace_output_ids: torch.Tensor,
+    v_mask: Optional[torch.Tensor] = None,
+    frame_interval_mask: Optional[torch.Tensor] = None,
+    device: Optional[torch.device] = None
+):
+
+    i = 0
     for i in range(inplace_output_ids.size(1)):
-        outputs = model(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True, v_mask=v_mask, frame_interval_mask=frame_interval_mask)
+        outputs = model.forward(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True, v_mask=v_mask, frame_interval_mask=frame_interval_mask)
         past_key_values = outputs.past_key_values
         new_token_id = outputs.logits[:, -1:].argmax(dim=-1)
         inplace_output_ids[:, i] = new_token_id
         if new_token_id == eos_token_id:
             break
         inputs_embeds = model.get_input_embeddings()(new_token_id)
-        v_mask = torch.zeros((1, new_token_id.shape[1]), device='cuda', dtype=torch.bool)
-        frame_interval_mask = torch.zeros_like(v_mask, device='cuda', dtype=torch.bool)
+        v_mask = torch.zeros((1, new_token_id.shape[1]), device=device, dtype=torch.bool)
+        frame_interval_mask = torch.zeros_like(v_mask, device=device, dtype=torch.bool)
     return inplace_output_ids[:, :i+1], past_key_values
 
 def build_live(
@@ -192,11 +543,11 @@ def build_live(
     is_training: bool,
     config_class: type,
     model_class: type,
-    llm_pretrained: str = None,
-    finetune_modules: list[str] = None,
-    lora_modules: str = None,
-    lora_r: int = None,
-    lora_alpha: int = None,
+    llm_pretrained: Optional[str] = None,
+    finetune_modules: Optional[list[str]] = None,
+    lora_modules: Optional[str] = None,
+    lora_r: Optional[int] = None,
+    lora_alpha: Optional[int] = None,
     set_vision_inside: bool = False,
     resume_from_checkpoint: str = '',
     attn_implementation: str = 'flash_attention_2',

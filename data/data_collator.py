@@ -29,5 +29,20 @@ def data_collator(batch: list[list], *, tokenizer: PreTrainedTokenizer, **kwargs
         batch['evaluation_kwargs'] = batch_evaluation_kwargs[0] # evaluation only supports bs = 1, so its okay
     return batch
 
+def conversation_data_collator(batch: list[list], *, tokenizer: PreTrainedTokenizer, **kwargs):
+    batch_conversation, batch_frames, batch_sample_index, batch_evaluation_kwargs  = list(zip(*batch))
+    if batch_evaluation_kwargs[0]:
+        batch_evaluation_kwargs = batch_evaluation_kwargs[0]
+    if batch_evaluation_kwargs is None:
+        batch_evaluation_kwargs = {}
+    return {
+        'conversations': batch_conversation,
+        'frames': torch.cat(batch_frames),
+        'sample_idxs': torch.tensor(batch_sample_index),
+        'evaluation_kwargs': batch_evaluation_kwargs
+    }
+
 def get_data_collator(**kwargs):
+    if kwargs.pop('use_conversation_eval', False):
+        return partial(conversation_data_collator, **kwargs)
     return partial(data_collator, **kwargs)

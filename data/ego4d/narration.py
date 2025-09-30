@@ -62,10 +62,29 @@ class Ego4DNarrationStream(Ego4D, StreamMixIn):
             json.dump(narration_streams, open(anno_path, 'w'), indent=4)
         return narration_streams
 
-    def __init__(self, *, split: str, frame_fps: int, is_training: bool, augmentation: bool, **kwargs):
-        super().__init__(split=split, frame_fps=frame_fps, augmentation=augmentation, is_training=is_training, **kwargs)
+    def __init__(self, *, split: str, frame_fps: int, is_training: bool, augmentation: bool, use_conversation_eval: bool = False, top_n_samples: int | None = None, **kwargs):
+        """
+        Args:
+            use_conversation_eval: 如果為 True，使用新的 conversation_stream_evaluate 方法
+            top_n_samples: 僅保留依片段時長由長到短的前 N 筆（為 None 或 <=0 時不啟用）。
+        """
+        super().__init__(split=split, frame_fps=frame_fps, augmentation=augmentation, is_training=is_training, use_conversation_eval=use_conversation_eval, **kwargs)
         self.is_training = is_training
         self.frame_fps = frame_fps
+        self.use_conversation_eval = use_conversation_eval
+        # 允許用環境變數覆蓋，以便快速小規模測試（例如：EGO4D_NARR_TOPN=50）
+        if top_n_samples is None:
+            try:
+                env_topn = int(os.environ.get('EGO4D_NARR_TOPN', '0') or '0')
+            except ValueError:
+                env_topn = 0
+            top_n_samples = env_topn if env_topn > 0 else None
+        self.top_n_samples = top_n_samples
+        self.min_selected_length_sec = None  # 被截斷後的最短片段長度（秒）
+        
+        # 根據評估方式設置 evaluation_kwargs
+        if use_conversation_eval:
+            self.evaluation_kwargs = DictWithTo(evaluator='conversation_stream_evaluate')
 
         annos = self.get_annos(split)
         self.annos = []
@@ -97,10 +116,33 @@ class Ego4DNarrationStream(Ego4D, StreamMixIn):
                     last_text = text
                 if not conversation:
                     continue
+                # 計算實際載入的影格範圍與片段長度（秒）
+                start_idx = int(start_time * frame_fps)
+                end_idx = int(last_time * frame_fps)
+                num_loaded_frames = max(0, end_idx - start_idx + 1)
+                length_sec = num_loaded_frames / frame_fps if frame_fps > 0 else 0.0
                 self.annos.append({
                     'conversation': conversation,
-                    'load_ranges': {self.metadata[video_uid]['path']: range(int(start_time*frame_fps), int(last_time*frame_fps)+1)}
+                    'load_ranges': {self.metadata[video_uid]['path']: range(start_idx, end_idx + 1)},
+                    'length_sec': length_sec,
+                    'video_uid': video_uid,
                 })
+
+        # 依片段時長由長到短排序，並根據需求只保留前 N 筆（僅當 top_n_samples>0 時啟用）
+        if self.annos and (self.top_n_samples is not None and self.top_n_samples > 0):
+            total = len(self.annos)
+            self.annos.sort(key=lambda a: a.get('length_sec', 0.0), reverse=True)
+            if total > self.top_n_samples:
+                self.annos = self.annos[:self.top_n_samples]
+            # 記錄並回報被截斷清單中的最短長度（秒）
+            self.min_selected_length_sec = min(a.get('length_sec', 0.0) for a in self.annos) if self.annos else None
+            try:
+                shortest = f"{self.min_selected_length_sec:.2f}s" if self.min_selected_length_sec is not None else "N/A"
+                longest = f"{self.annos[0].get('length_sec', 0.0):.2f}s" if self.annos else "N/A"
+                kept = len(self.annos)
+                print(f"[Ego4DNarrationStream] Sorted by length desc; kept {kept}/{total} samples. Shortest among kept: {shortest}, longest: {longest}.")
+            except Exception:
+                pass
 
     def preprocess_conversation(self, conversation):
         assert conversation[0]['role'] == 'stream' and conversation[0]['num_frames'] == 1
@@ -130,12 +172,61 @@ class Ego4DNarrationStream(Ego4D, StreamMixIn):
         return dst
 
     def compute_metrics(self, eval_predictions: EvalPrediction, *args, **kwargs):
+        # 若使用 conversation_stream_evaluate，predictions 為:
+        # [time_mae, time_acc, <text metrics...>, f1]
+        if getattr(self, 'use_conversation_eval', False):
+            vec = torch.from_numpy(eval_predictions.predictions).mean(dim=0).tolist()
+
+            # 解析文字指標設定
+            def _normalize_metric_name(name: str) -> str:
+                n = str(name).strip().lower()
+                if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
+                    return 'rougelsum'
+                if n in ('meteor',):
+                    return 'meteor'
+                if n in ('jaccard', 'jac'):
+                    return 'jaccard'
+                return n
+
+            text_metrics_raw = kwargs.get('eval_text_metrics', None)
+            if text_metrics_raw is None:
+                single_metric = kwargs.get('eval_text_metric', 'rougeLsum')
+                if isinstance(single_metric, str) and ',' in single_metric:
+                    text_metric_list = [m for m in single_metric.split(',') if m.strip()]
+                else:
+                    text_metric_list = [single_metric]
+            else:
+                if isinstance(text_metrics_raw, str):
+                    text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
+                else:
+                    text_metric_list = list(text_metrics_raw)
+            text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
+            if not text_metric_list:
+                text_metric_list = ['rougelsum']
+
+            # 映射輸出向量
+            time_mae = float(vec[0]) if len(vec) > 0 else 0.0
+            time_acc = float(vec[1]) if len(vec) > 1 else 0.0
+            k = len(text_metric_list)
+            text_vals = vec[2:2+k] if len(vec) >= 2+k else [0.0]*k
+            match_f1 = float(vec[2+k]) if len(vec) > 2+k else 0.0
+
+            metrics = {
+                'time_mae': time_mae,
+                'time_acc_3f': time_acc,
+                'match_f1': match_f1,
+            }
+            for name, val in zip(text_metric_list, text_vals):
+                metrics[name] = float(val)
+            return metrics
+
+        # 舊的 stream_evaluate 路徑
         lm_ppl, frame_diff, fluency, lm_correctness = torch.from_numpy(eval_predictions.predictions).mean(dim=0).tolist()
         return {
-            f'lm_ppl': lm_ppl,
-            f'time_diff': frame_diff / self.frame_fps,
-            f'fluency': fluency,
-            f'lm_correctness': lm_correctness
+            'lm_ppl': lm_ppl,
+            'time_diff': frame_diff / self.frame_fps,
+            'fluency': fluency,
+            'lm_correctness': lm_correctness
         }
 
 def build_ego4d_narration_stream_train(**kwargs):

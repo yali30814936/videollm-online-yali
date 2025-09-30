@@ -4,13 +4,14 @@ from transformers import PreTrainedTokenizer
 from .utils import rand_bool
 
 class StreamMixIn(torch.utils.data.Dataset):
-    def __init__(self, is_training: bool, system_prompt: str, augmentation: bool, max_num_frames: int, tokenizer: PreTrainedTokenizer, **kwargs):
+    def __init__(self, is_training: bool, system_prompt: str, augmentation: bool, max_num_frames: int, tokenizer: PreTrainedTokenizer, use_conversation_eval: bool, **kwargs):
         super().__init__()
         self.is_training = is_training
         self.system_prompt = system_prompt
         self.augmentation = augmentation
         self.tokenizer = tokenizer
         self.max_num_frames = max_num_frames
+        self.use_conversation_eval = use_conversation_eval
         assert system_prompt is not None, 'Please add a system prompt'
 
     # NOTE: this augmentation is to reduce the text dependency
@@ -95,6 +96,8 @@ class StreamMixIn(torch.utils.data.Dataset):
         if self.augmentation:
             conversation = self.augment(conversation)
         conversation = [{"role": "system", "content": self.system_prompt}] + conversation
+        if self.use_conversation_eval:
+            return conversation, frames
         text = self.tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=add_generation_prompt)
         # 3. learn ranges
         learn_ranges = self.tokenizer.get_learn_ranges(conversation) if not add_generation_prompt else []

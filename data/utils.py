@@ -93,18 +93,17 @@ def distributed_encode(*, src_root: str, vision_pretrained: str, vision_encode: 
     src_root = src_root.rstrip('/')
     model = AutoModel.from_pretrained(vision_pretrained, device_map=f'cuda:{env.local_rank}').vision_model
     model.eval()
-    dst_root = f"{src_root.replace('2fps', '1fps')}_{embed_mark.split('_')[-1]}_{vision_pretrained.replace('/', '--')}"
+    dst_root = f"{src_root}_{embed_mark.split('_')[-1]}_{vision_pretrained.replace('/', '--')}"
     os.makedirs(dst_root, exist_ok=True)
-    for i, file in tqdm.tqdm(enumerate(os.listdir(src_root)), desc=f'{src_root} -> {dst_root}'):
+    target = (os.path.splitext(i)[0] for i in os.listdir(src_root))
+    processed = (os.path.splitext(i)[0] for i in os.listdir(dst_root))
+    target = set(target) - set(processed)
+    for i, file in tqdm.tqdm(enumerate(target), desc=f'{src_root} -> {dst_root}'):
         if i % env.num_tasks != env.global_rank:
             continue
-        frame_path = os.path.join(src_root, file)
-        save_path = os.path.splitext(frame_path)[0] + '.pt'
-        save_path = save_path.replace(src_root, dst_root)
-        if os.path.exists(save_path):
-            continue
+        frame_path = os.path.join(src_root, file + '.mp4')
+        save_path = os.path.join(dst_root, file + '.pt')
         frames = torchvision.io.read_video(frame_path, pts_unit='sec', output_format='TCHW')[0]
-        frames = frames[::2]
         with torch.no_grad():
             frames = torch.cat([vision_encode(model, batch.to(f'cuda:{env.local_rank}')).cpu() for batch in frames.split(batch_size)])
         if save_bf16:
