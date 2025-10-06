@@ -23,6 +23,107 @@ class LiveMixin(AutoModelForCausalLM):
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
 
+    def _get_text_metric_config(self) -> list[str]:
+        """獲取文本評估度量配置，返回標準化的度量名稱列表"""
+        def _normalize_metric_name(name: str) -> str:
+            n = name.strip().lower()
+            if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
+                return 'rougelsum'
+            if n in ('meteor',):
+                return 'meteor'
+            if n in ('jaccard', 'jac'):
+                return 'jaccard'
+            return n
+
+        text_metrics_raw = getattr(self.config, 'eval_text_metrics', None)
+        if text_metrics_raw is None:
+            single_metric = getattr(self.config, 'eval_text_metric', 'rougeLsum')
+            if isinstance(single_metric, str) and ',' in single_metric:
+                text_metric_list = [m for m in single_metric.split(',') if m.strip()]
+            else:
+                text_metric_list = [single_metric]
+        else:
+            if isinstance(text_metrics_raw, str):
+                text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
+            else:
+                text_metric_list = list(text_metrics_raw)
+        text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
+        if not text_metric_list:
+            text_metric_list = ['rougelsum']
+        return text_metric_list
+
+    def _init_text_metric_scorers(self, text_metric_list: list[str]) -> tuple:
+        """初始化文本度量所需的評分器
+        返回: (meteor_fn, rouge_scorer)
+        """
+        need_meteor = any(m == 'meteor' for m in text_metric_list)
+        need_rouge = any(m == 'rougelsum' for m in text_metric_list)
+
+        meteor_fn = None
+        rouge_scorer = None
+        if need_meteor:
+            try:
+                from nltk.translate.meteor_score import meteor_score  # type: ignore
+                meteor_fn = meteor_score
+            except Exception:
+                meteor_fn = None
+        if need_rouge:
+            try:
+                from rouge_score.rouge_scorer import RougeScorer  # type: ignore
+                rouge_scorer = RougeScorer(['rougeLsum'], use_stemmer=False)
+            except Exception:
+                rouge_scorer = None
+        return meteor_fn, rouge_scorer
+
+    def _compute_text_similarities(self, hyp: str, ref: str, text_metric_list: list[str], meteor_fn=None, rouge_scorer=None) -> list[float]:
+        """計算預測文本與參考文本之間的相似度
+        
+        Args:
+            hyp: 預測文本
+            ref: 參考文本
+            text_metric_list: 要使用的度量列表
+            meteor_fn: METEOR 評分函數（可選）
+            rouge_scorer: ROUGE 評分器（可選）
+            
+        Returns:
+            每個度量的相似度分數列表
+        """
+        def _jaccard(h: str, r: str) -> float:
+            a = set([t for t in re.split(r"[^\w]+", (h or '').lower()) if t])
+            b = set([t for t in re.split(r"[^\w]+", (r or '').lower()) if t])
+            if not a and not b:
+                return 1.0
+            inter = len(a & b)
+            union = len(a | b)
+            return inter / union if union > 0 else 0.0
+
+        sims: list[float] = []
+        for m in text_metric_list:
+            if m == 'meteor':
+                if meteor_fn is not None:
+                    try:
+                        sims.append(float(meteor_fn([ref or ''], hyp or '')))
+                        continue
+                    except Exception:
+                        pass
+                # fallback
+                sims.append(_jaccard(hyp, ref))
+            elif m == 'rougelsum':
+                if rouge_scorer is not None:
+                    try:
+                        score = rouge_scorer.score(ref or '', hyp or '')
+                        sims.append(float(score['rougeLsum'].fmeasure))
+                        continue
+                    except Exception:
+                        pass
+                sims.append(_jaccard(hyp, ref))
+            elif m == 'jaccard':
+                sims.append(_jaccard(hyp, ref))
+            else:
+                # 未知名稱：退回 Jaccard
+                sims.append(_jaccard(hyp, ref))
+        return sims
+
     def visual_embed(self, frames: torch.Tensor):
         if hasattr(self, 'vision_encode'):
             with torch.cuda.amp.autocast():
@@ -56,6 +157,18 @@ class LiveMixin(AutoModelForCausalLM):
         frame_token_interval_threshold: float = 0.0,
         **kwargs
     ):
+        use_advanced_text_sim = hasattr(self.config, 'eval_text_metrics') and self.config.eval_text_metrics is not None
+        llm_response_head_len = len("Assistant: ")
+        
+        _turn_text_sims = []
+        _text_metric_list = None
+        _meteor_fn = None
+        _rouge_scorer = None
+        
+        if use_advanced_text_sim:
+            _text_metric_list = self._get_text_metric_config()
+            _meteor_fn, _rouge_scorer = self._init_text_metric_scorers(_text_metric_list)
+        
         # 0. evaluation only supports batch_size = 1
         assert input_ids.size(0) == labels.size(0) == 1
         input_id, label = input_ids[0], labels[0]
@@ -105,6 +218,24 @@ class LiveMixin(AutoModelForCausalLM):
                 else:
                     num_lm_correct_tokens = (~turn_lm_masked_wrong_mask).sum()
                 lm_correctness.append(num_lm_correct_tokens / turn_lm_masked_label.numel())
+                
+                # 計算文本相似度
+                if use_advanced_text_sim:
+                    tokenizer = kwargs['tokenizer']
+                    # 獲取預測文本
+                    pred_token_ids = turn_lm_masked_logit.argmax(dim=-1)
+                    pred_text = tokenizer.decode(pred_token_ids, skip_special_tokens=True)[llm_response_head_len:]
+                    # 獲取真實文本
+                    ref_text = tokenizer.decode(turn_lm_masked_label, skip_special_tokens=True)[llm_response_head_len:]
+                    
+                    # 計算文本相似度（使用函數級別的評分器）
+                    text_sims = self._compute_text_similarities(
+                        pred_text, ref_text, 
+                        _text_metric_list,
+                        _meteor_fn, 
+                        _rouge_scorer
+                    )
+                    _turn_text_sims.append(text_sims)
 
             ## 3.3. frame_diff (will be casted to time_diff in compute_metrics)
             if turn_stream_mask.any():
@@ -170,10 +301,79 @@ class LiveMixin(AutoModelForCausalLM):
         frame_diff = torch.stack(frame_diffs).float().mean() if frame_diffs else zero
         fluency = torch.stack(fluencies).float().mean() if fluencies else one
         lm_correctness = torch.stack(lm_correctness).float().mean() if lm_correctness else one
-        return torch.stack([lm_ppl, frame_diff, fluency, lm_correctness])
+        
+        # 構建返回結果，格式與 conversation_stream_evaluate 一致
+        # 基礎指標：[lm_ppl, frame_diff, fluency, lm_correctness]
+        result_list = [lm_ppl, frame_diff, fluency, lm_correctness]
+        
+        # 添加文本相似度指標（如果有計算）
+        if use_advanced_text_sim and _turn_text_sims:
+            # 計算每個度量的平均值
+            num_metrics = len(_turn_text_sims[0])
+            for i in range(num_metrics):
+                avg_sim = sum(sims[i] for sims in _turn_text_sims) / len(_turn_text_sims)
+                result_list.append(torch.tensor(avg_sim, dtype=torch.float, device=device))
+        
+        # 在模型設備上構建結果 tensor（與 _evaluate_responses 一致）
+        try:
+            model_device = next(self.parameters()).device
+        except Exception:
+            model_device = device
+        
+        # 將所有元素轉換為相同設備和類型
+        result_metrics = []
+        for metric in result_list:
+            if isinstance(metric, torch.Tensor):
+                result_metrics.append(metric.to(device=model_device, dtype=torch.float32))
+            else:
+                result_metrics.append(torch.tensor(float(metric), dtype=torch.float32, device=model_device))
+        
+        # 返回 [1, N] 形狀的 tensor，與 conversation_stream_evaluate 一致
+        result = torch.stack(result_metrics).unsqueeze(0)
+        return result
 
     def trim_past_key_values(self, past_key_values, start, stop):
         return [[past_keys[:,:,start:stop], past_values[:,:,start:stop]] for past_keys, past_values in past_key_values]
+
+    class FrameCache:
+        def __init__(
+            self,
+            frames,
+            device,
+            chunk_size: int = 64,
+            prefetch_ratio: int = 5,
+        ):
+            self.chunk_size = chunk_size
+            self.prefetch_ratio = prefetch_ratio
+            self.write_ptr = 0
+            self.read_ptr = 0
+            self.num_frames = frames.size(0)
+            self.device = device
+
+            self.buffer_size = chunk_size * prefetch_ratio
+            self.buffer = torch.zeros((self.buffer_size,) + frames.shape[1:], dtype=frames.dtype, device=device)
+            self.cpu_frames = frames
+        
+        def prefill(self):
+            num_to_load = min(self.chunk_size * (self.prefetch_ratio // 2), self.num_frames - self.write_ptr)
+            if num_to_load > 0:
+                self.buffer[:num_to_load] = self.cpu_frames[self.write_ptr:self.write_ptr+num_to_load].to(self.device, non_blocking=True)
+                self.write_ptr += num_to_load
+
+        def __iter__(self):
+            self.read_ptr = 0
+            return self
+
+        def __next__(self):
+            if self.read_ptr >= self.num_frames:
+                raise StopIteration
+            # If buffer is exhausted, prefill more frames
+            buffer_idx = self.read_ptr % self.buffer_size
+            if buffer_idx == 0 and self.read_ptr != 0:
+                self.prefill()
+            frame = self.buffer[buffer_idx]
+            self.read_ptr += 1
+            return frame
 
     @torch.no_grad()
     def conversation_stream_evaluate(
@@ -183,15 +383,29 @@ class LiveMixin(AutoModelForCausalLM):
         tokenizer: PreTrainedTokenizer,
         frame_token_interval_threshold: float = 0.725,
         max_new_tokens: int = 100,
+        frame_chunk_size: int = 64,
+        prefetch_ratio: int = 5,
         **kwargs
     ):
-        device = frames.device
+        device = self.model.device
+        stream_frames = (frames.device != device)
         conversations = conversations[0]
         state = self._init_simulation_state(device, frame_token_interval_threshold, max_new_tokens, tokenizer)
 
         query_queue = deque()
         gt_responses = []
         pd_responses = []
+
+        # Prefetch frames to device (non-blocking)
+        if stream_frames:
+            frame_buffer = self.FrameCache(
+                frames=frames,
+                device=device,
+                chunk_size=frame_chunk_size,
+                prefetch_ratio=prefetch_ratio
+            )
+        else:
+            frame_buffer = frames
 
         # Prepare for response generation
         fid = 0
@@ -205,7 +419,7 @@ class LiveMixin(AutoModelForCausalLM):
 
         # Process frames
         last_role = None
-        for fid, frame in enumerate(frames):
+        for fid, frame in enumerate(frame_buffer):
             turn_conversations = []
             while query_queue and query_queue[0][0] == fid:
                 _, conv = query_queue.popleft()
@@ -244,7 +458,6 @@ class LiveMixin(AutoModelForCausalLM):
                 last_role = 'assistant'
 
         return self._evaluate_responses(pd_responses, gt_responses)
-        # return torch.tensor([0.0, 1.0, 1.0, 0.0], dtype=torch.float32, device=device)
 
     def _simulate_stream_step(self, state, frame):
         device = state['device']
@@ -360,33 +573,8 @@ class LiveMixin(AutoModelForCausalLM):
         回傳: torch.float32 tensor [time_mae(sec), time_acc(<=3/fps s), text_sim, f1]
         """
 
-        # 文本相似度：支援多種度量，依 self.config.eval_text_metrics（list/tuple/逗號字串）決定
-        # 若未指定，退回 self.config.eval_text_metric 或預設 rougeLsum
-        def _normalize_metric_name(name: str) -> str:
-            n = name.strip().lower()
-            if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
-                return 'rougelsum'
-            if n in ('meteor',):
-                return 'meteor'
-            if n in ('jaccard', 'jac'):  # 明確 jaccard
-                return 'jaccard'
-            return n
-
-        text_metrics_raw = getattr(self.config, 'eval_text_metrics', None)
-        if text_metrics_raw is None:
-            single_metric = getattr(self.config, 'eval_text_metric', 'rougeLsum')
-            if isinstance(single_metric, str) and ',' in single_metric:
-                text_metric_list = [m for m in single_metric.split(',') if m.strip()]
-            else:
-                text_metric_list = [single_metric]
-        else:
-            if isinstance(text_metrics_raw, str):
-                text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
-            else:
-                text_metric_list = list(text_metrics_raw)
-        text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
-        if not text_metric_list:
-            text_metric_list = ['rougelsum']
+        # 使用共享的配置獲取方法
+        text_metric_list = self._get_text_metric_config()
 
         # 提取 frame index 與文本
         pd_fids = [fid for fid, _ in pd_responses]
@@ -420,67 +608,21 @@ class LiveMixin(AutoModelForCausalLM):
             k = min(n_pred, n_gt)
             rows, cols = pd_sorted[:k], gt_sorted[:k]
 
-        need_meteor = any(m == 'meteor' for m in text_metric_list)
-        need_rouge = any(m == 'rougelsum' for m in text_metric_list)
-
-        meteor_fn = None
-        rouge_scorer = None
-        if need_meteor:
-            try:
-                from nltk.translate.meteor_score import meteor_score  # type: ignore
-                meteor_fn = meteor_score
-            except Exception:
-                meteor_fn = None
-        if need_rouge:
-            try:
-                from rouge_score.rouge_scorer import RougeScorer  # type: ignore
-                rouge_scorer = RougeScorer(['rougeLsum'], use_stemmer=False)
-            except Exception:
-                rouge_scorer = None
-
-        def _jaccard(hyp: str, ref: str) -> float:
-            a = set([t for t in re.split(r"[^\w]+", (hyp or '').lower()) if t])
-            b = set([t for t in re.split(r"[^\w]+", (ref or '').lower()) if t])
-            if not a and not b:
-                return 1.0
-            inter = len(a & b)
-            union = len(a | b)
-            return inter / union if union > 0 else 0.0
-
-        def compute_text_sims(hyp: str, ref: str) -> list[float]:
-            sims: list[float] = []
-            for m in text_metric_list:
-                if m == 'meteor':
-                    if meteor_fn is not None:
-                        try:
-                            sims.append(float(meteor_fn([ref or ''], hyp or '')))
-                            continue
-                        except Exception:
-                            pass
-                    # fallback
-                    sims.append(_jaccard(hyp, ref))
-                elif m == 'rougelsum':
-                    if rouge_scorer is not None:
-                        try:
-                            score = rouge_scorer.score(ref or '', hyp or '')
-                            sims.append(float(score['rougeLsum'].fmeasure))
-                            continue
-                        except Exception:
-                            pass
-                    sims.append(_jaccard(hyp, ref))
-                elif m == 'jaccard':
-                    sims.append(_jaccard(hyp, ref))
-                else:
-                    # 未知名稱：退回 Jaccard
-                    sims.append(_jaccard(hyp, ref))
-            return sims
+        # 使用共享的評分器初始化方法
+        meteor_fn, rouge_scorer = self._init_text_metric_scorers(text_metric_list)
 
         # 匹配後計算指標
         abs_diffs_frames = []
         text_sims_all: list[list[float]] = []
         for pi, gi in zip(rows, cols):
             abs_diffs_frames.append(abs(pd_fids[pi] - gt_fids[gi]))
-            text_sims_all.append(compute_text_sims(pd_texts[pi], gt_texts[gi]))
+            # 使用共享的文本相似度計算方法
+            text_sims_all.append(self._compute_text_similarities(
+                pd_texts[pi], gt_texts[gi], 
+                text_metric_list, 
+                meteor_fn, 
+                rouge_scorer
+            ))
 
         matched = len(abs_diffs_frames)
         fps = float(getattr(self.config, 'frame_fps', 2) or 2)

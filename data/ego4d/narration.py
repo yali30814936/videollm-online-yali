@@ -172,42 +172,47 @@ class Ego4DNarrationStream(Ego4D, StreamMixIn):
         return dst
 
     def compute_metrics(self, eval_predictions: EvalPrediction, *args, **kwargs):
-        # 若使用 conversation_stream_evaluate，predictions 為:
-        # [time_mae, time_acc, <text metrics...>, f1]
-        if getattr(self, 'use_conversation_eval', False):
-            vec = torch.from_numpy(eval_predictions.predictions).mean(dim=0).tolist()
+        vec = torch.from_numpy(eval_predictions.predictions).mean(dim=0).tolist()
+        
+        # 解析文字指標設定（用於判斷返回格式）
+        def _normalize_metric_name(name: str) -> str:
+            n = str(name).strip().lower()
+            if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
+                return 'rougelsum'
+            if n in ('meteor',):
+                return 'meteor'
+            if n in ('jaccard', 'jac'):
+                return 'jaccard'
+            return n
 
-            # 解析文字指標設定
-            def _normalize_metric_name(name: str) -> str:
-                n = str(name).strip().lower()
-                if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
-                    return 'rougelsum'
-                if n in ('meteor',):
-                    return 'meteor'
-                if n in ('jaccard', 'jac'):
-                    return 'jaccard'
-                return n
-
-            text_metrics_raw = kwargs.get('eval_text_metrics', None)
-            if text_metrics_raw is None:
-                single_metric = kwargs.get('eval_text_metric', 'rougeLsum')
-                if isinstance(single_metric, str) and ',' in single_metric:
-                    text_metric_list = [m for m in single_metric.split(',') if m.strip()]
-                else:
-                    text_metric_list = [single_metric]
+        text_metrics_raw = kwargs.get('eval_text_metrics', None)
+        if text_metrics_raw is None:
+            single_metric = kwargs.get('eval_text_metric', None)
+            if single_metric and isinstance(single_metric, str) and ',' in single_metric:
+                text_metric_list = [m for m in single_metric.split(',') if m.strip()]
+            elif single_metric:
+                text_metric_list = [single_metric]
             else:
-                if isinstance(text_metrics_raw, str):
-                    text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
-                else:
-                    text_metric_list = list(text_metrics_raw)
-            text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
-            if not text_metric_list:
-                text_metric_list = ['rougelsum']
-
-            # 映射輸出向量
+                text_metric_list = []
+        else:
+            if isinstance(text_metrics_raw, str):
+                text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
+            else:
+                text_metric_list = list(text_metrics_raw)
+        text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
+        
+        # 判斷使用的評估器類型
+        # conversation_stream_evaluate: [time_mae, time_acc, <text metrics...>, f1]
+        # stream_evaluate (有 text metrics): [lm_ppl, frame_diff, fluency, lm_correctness, <text metrics...>]
+        # stream_evaluate (無 text metrics): [lm_ppl, frame_diff, fluency, lm_correctness]
+        
+        use_conversation_eval = getattr(self, 'use_conversation_eval', False)
+        
+        if use_conversation_eval:
+            # conversation_stream_evaluate 格式
             time_mae = float(vec[0]) if len(vec) > 0 else 0.0
             time_acc = float(vec[1]) if len(vec) > 1 else 0.0
-            k = len(text_metric_list)
+            k = len(text_metric_list) if text_metric_list else 1  # 預設至少有一個文本指標
             text_vals = vec[2:2+k] if len(vec) >= 2+k else [0.0]*k
             match_f1 = float(vec[2+k]) if len(vec) > 2+k else 0.0
 
@@ -216,18 +221,33 @@ class Ego4DNarrationStream(Ego4D, StreamMixIn):
                 'time_acc_3f': time_acc,
                 'match_f1': match_f1,
             }
-            for name, val in zip(text_metric_list, text_vals):
-                metrics[name] = float(val)
-            return metrics
-
-        # 舊的 stream_evaluate 路徑
-        lm_ppl, frame_diff, fluency, lm_correctness = torch.from_numpy(eval_predictions.predictions).mean(dim=0).tolist()
-        return {
-            'lm_ppl': lm_ppl,
-            'time_diff': frame_diff / self.frame_fps,
-            'fluency': fluency,
-            'lm_correctness': lm_correctness
-        }
+            if text_metric_list:
+                for name, val in zip(text_metric_list, text_vals):
+                    metrics[name] = float(val)
+            else:
+                # 如果沒有指定 text_metric_list，使用預設名稱
+                metrics['text_sim'] = float(text_vals[0]) if text_vals else 0.0
+        else:
+            # stream_evaluate 格式
+            lm_ppl = float(vec[0]) if len(vec) > 0 else 0.0
+            frame_diff = float(vec[1]) if len(vec) > 1 else 0.0
+            fluency = float(vec[2]) if len(vec) > 2 else 0.0
+            lm_correctness = float(vec[3]) if len(vec) > 3 else 0.0
+            
+            metrics = {
+                'lm_ppl': lm_ppl,
+                'time_diff': frame_diff / self.frame_fps,
+                'fluency': fluency,
+                'lm_correctness': lm_correctness
+            }
+            
+            # 如果有額外的文本相似度指標
+            if len(vec) > 4 and text_metric_list:
+                text_vals = vec[4:4+len(text_metric_list)]
+                for name, val in zip(text_metric_list, text_vals):
+                    metrics[name] = float(val)
+        
+        return metrics
 
 def build_ego4d_narration_stream_train(**kwargs):
     return Ego4DNarrationStream(split='train', **kwargs)

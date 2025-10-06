@@ -10,7 +10,10 @@ class TrainerWithGenToEval(Trainer):
         ignore_keys=None,
     ):
         with torch.no_grad(), self.compute_loss_context_manager():
+            # frames = inputs.pop('frames')
             inputs = self._prepare_inputs(inputs)
+            # if frames is not None:
+            #     inputs['frames'] = frames
             if prediction_loss_only:
                 loss = self.compute_loss(model, inputs, return_outputs=False)
                 return (loss, None, None)
@@ -38,11 +41,9 @@ class TrainerWithGenToEval(Trainer):
                 'eos_token_id': eos_token_id
             }
             
-            # 為 conversation_stream_evaluate 添加額外的參數
-            if evaluator == 'conversation_stream_evaluate':                
-                # 添加 tokenizer（如果存在）
-                if hasattr(self, 'tokenizer') and self.tokenizer is not None:
-                    extra_kwargs['tokenizer'] = self.tokenizer
+            # 添加 tokenizer（如果存在）
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                extra_kwargs['tokenizer'] = self.tokenizer
             
             # 合併所有參數
             all_kwargs = {**inputs, **evaluation_kwargs, **extra_kwargs}  # type: ignore
