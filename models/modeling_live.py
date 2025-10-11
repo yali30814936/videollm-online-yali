@@ -1,9 +1,16 @@
 import torch, re
+import numpy as np
+import json
+import os
 from collections import deque
 from typing import Optional, Any
+from pathlib import Path
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, Cache, PreTrainedTokenizer
 from transformers.utils import logging
+from scipy.optimize import linear_sum_assignment  # type: ignore
+from nltk.translate.meteor_score import meteor_score
+from rouge_score.rouge_scorer import RougeScorer
 
 from .tokenization_live import build_live_tokenizer_and_update_config
 from .vision_live import build_live_vision
@@ -63,13 +70,11 @@ class LiveMixin(AutoModelForCausalLM):
         rouge_scorer = None
         if need_meteor:
             try:
-                from nltk.translate.meteor_score import meteor_score  # type: ignore
                 meteor_fn = meteor_score
             except Exception:
                 meteor_fn = None
         if need_rouge:
             try:
-                from rouge_score.rouge_scorer import RougeScorer  # type: ignore
                 rouge_scorer = RougeScorer(['rougeLsum'], use_stemmer=False)
             except Exception:
                 rouge_scorer = None
@@ -385,8 +390,40 @@ class LiveMixin(AutoModelForCausalLM):
         max_new_tokens: int = 100,
         frame_chunk_size: int = 64,
         prefetch_ratio: int = 5,
+        sample_uid: str = None,
+        prediction_cache_dir: str = None,
+        skip_inference: bool = False,
         **kwargs
     ):
+        """
+        對話流式評估方法，支持兩階段處理：
+        1. 生成階段：運行模型推理並儲存預測結果
+        2. 評估階段：讀取已保存的結果並計算指標
+        
+        Args:
+            sample_uid: 測資的唯一識別碼（通常是 video_uid 或 annotation_uid）
+            prediction_cache_dir: 預測結果緩存目錄
+            skip_inference: 是否跳過推理階段，直接從緩存讀取
+        """
+        # 如果提供了緩存目錄，檢查是否已有結果
+        if prediction_cache_dir and sample_uid:
+            cache_path = self._get_prediction_cache_path(prediction_cache_dir, sample_uid)
+            
+            # 如果要求跳過推理或已有緩存，嘗試從緩存讀取
+            if skip_inference or os.path.exists(cache_path):
+                cached_result = self._load_prediction_from_cache(cache_path)
+                if cached_result is not None:
+                    logger.info(f"Loaded cached prediction for {sample_uid}")
+                    return self._evaluate_responses(
+                        cached_result['pd_responses'], 
+                        cached_result['gt_responses']
+                    )
+                elif skip_inference:
+                    logger.warning(f"skip_inference=True but cache not found for {sample_uid}, skipping...")
+                    # 返回全零指標
+                    return self._get_zero_metrics()
+        
+        # 執行推理生成預測
         device = self.model.device
         stream_frames = (frames.device != device)
         conversations = conversations[0]
@@ -419,6 +456,12 @@ class LiveMixin(AutoModelForCausalLM):
 
         # Process frames
         last_role = None
+        
+        # 如果需要緩存，準備緩存路徑和即時保存機制
+        cache_path = None
+        if prediction_cache_dir and sample_uid:
+            cache_path = self._get_prediction_cache_path(prediction_cache_dir, sample_uid)
+        
         for fid, frame in enumerate(frame_buffer):
             turn_conversations = []
             while query_queue and query_queue[0][0] == fid:
@@ -433,6 +476,10 @@ class LiveMixin(AutoModelForCausalLM):
                     add_stream_generation_prompt=False,
                     return_tensors='pt'
                 ).to(device)
+                if last_role == 'assistant':
+                    state['last_ids'] = torch.cat([
+                        torch.tensor([[tokenizer.eos_token_id]], device=device),
+                        state['last_ids']], dim=1)
                 last_role = turn_conversations[-1]['role']
             elif last_role == 'assistant':
                 state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
@@ -457,11 +504,124 @@ class LiveMixin(AutoModelForCausalLM):
                 }))
                 last_role = 'assistant'
 
+        if cache_path:
+            self._save_prediction_to_cache(
+                cache_path=cache_path,
+                sample_uid=sample_uid,
+                pd_responses=pd_responses,
+                gt_responses=gt_responses
+            )
+
         return self._evaluate_responses(pd_responses, gt_responses)
+
+    def _get_prediction_cache_path(self, cache_dir: str, sample_uid: str) -> str:
+        """獲取預測結果的緩存路徑"""
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        return os.path.join(cache_dir, f"{sample_uid}.json")
+    
+    def _save_prediction_to_cache(self, cache_path: str, sample_uid: str, pd_responses: list, gt_responses: list):
+        """將預測結果保存到緩存檔案
+        
+        Args:
+            cache_path: 緩存檔案路徑
+            sample_uid: 測資唯一識別碼
+            pd_responses: 預測的回應列表 [(frame_id, response_dict), ...]
+            gt_responses: 標註的回應列表 [(frame_id, response_dict), ...]
+        """
+        # 獲取 fps 用於時間轉換
+        fps = float(getattr(self.config, 'frame_fps', 2) or 2)
+        fps = fps if fps > 0 else 1.0
+        
+        # 將 frame index 轉換為秒，並只保留 content（移除 role）
+        def convert_to_seconds(responses):
+            result = []
+            for fid, resp in responses:
+                timestamp = fid / fps
+                # 只保留 content，移除 role 和其他不需要的欄位
+                content = resp.get('content', '') if isinstance(resp, dict) else str(resp)
+                result.append([timestamp, content])
+            return result
+        
+        cache_data = {
+            'sample_uid': sample_uid,
+            'pd_responses': convert_to_seconds(pd_responses),
+            'gt_responses': convert_to_seconds(gt_responses),
+            'fps': fps
+        }
+        
+        # 寫入 JSON 檔案（一個檔案一筆測資）
+        try:
+            # 確保父目錄存在
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved prediction to {cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save prediction to {cache_path}: {e}")
+    
+    def _load_prediction_from_cache(self, cache_path: str) -> Optional[dict]:
+        """從緩存檔案讀取預測結果
+        
+        Returns:
+            包含 pd_responses 和 gt_responses 的字典，時間戳記已轉回 frame index
+            如果讀取失敗則返回 None
+        """
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            # 獲取 fps
+            fps = cache_data.get('fps', 2.0)
+            
+            # 將秒轉換回 frame index
+            # 緩存格式: [[timestamp, content], ...]
+            # 返回格式: [(frame_id, content), ...] - 直接返回字符串，與 _evaluate_responses 的 extract_content 兼容
+            def convert_to_frames(responses):
+                result = []
+                for item in responses:
+                    if isinstance(item, list) and len(item) >= 2:
+                        timestamp, content = item[0], item[1]
+                        fid = int(round(timestamp * fps))
+                        # 直接返回字符串內容，不需要包裝成字典
+                        if isinstance(content, dict):
+                            # 兼容舊格式（如果有）
+                            result.append((fid, content.get('content', '')))
+                        else:
+                            result.append((fid, content))
+                    else:
+                        logger.warning(f"Unexpected cache format: {item}")
+                return result
+            
+            return {
+                'pd_responses': convert_to_frames(cache_data['pd_responses']),
+                'gt_responses': convert_to_frames(cache_data['gt_responses'])
+            }
+        except Exception as e:
+            logger.warning(f"Failed to load prediction from {cache_path}: {e}")
+            return None
+    
+    def _get_zero_metrics(self):
+        """返回全零的指標，用於跳過的測資"""
+        text_metric_list = self._get_text_metric_config()
+        num_metrics = 2 + len(text_metric_list) + 1  # time_mae, time_acc, text_metrics..., f1
+        
+        try:
+            model_device = next(self.parameters()).device
+        except Exception:
+            model_device = torch.device('cpu')
+        
+        return torch.zeros(num_metrics, dtype=torch.float32, device=model_device)
 
     def _simulate_stream_step(self, state, frame):
         device = state['device']
         
+        input_ids = torch.cat([
+            state['last_ids'],
+            torch.tensor([[self.config.v_placeholder_id] * self.config.frame_num_tokens], device=device)
+        ], dim=1)
         input_embeds = torch.cat([
             self.get_input_embeddings()(state['last_ids'].to(device)),
             self.visual_embed(frame).view(1, -1, self.config.hidden_size)
@@ -481,7 +641,8 @@ class LiveMixin(AutoModelForCausalLM):
             frame_interval_mask = frame_interval_mask,
             past_key_values = state.get('past_key_values', None),
             return_dict = True,
-            use_cache = True
+            use_cache = True,
+            input_ids = input_ids
         )
         
         state['past_key_values'] = outputs.past_key_values
@@ -508,7 +669,8 @@ class LiveMixin(AutoModelForCausalLM):
             frame_interval_mask=frame_interval_mask,
             eos_token_id=eos_token_id,
             inplace_output_ids=state['inplace_output_ids'],
-            device=device
+            device=device,
+            input_ids = state['last_ids']
         )
         
         state['last_ids'] = output_ids[:,-1:]
@@ -576,11 +738,21 @@ class LiveMixin(AutoModelForCausalLM):
         # 使用共享的配置獲取方法
         text_metric_list = self._get_text_metric_config()
 
-        # 提取 frame index 與文本
+        # 提取 frame index 與文本（兼容字典和字符串兩種格式）
         pd_fids = [fid for fid, _ in pd_responses]
         gt_fids = [fid for fid, _ in gt_responses]
-        pd_texts = [res[1].get('content', '') for res in pd_responses]
-        gt_texts = [res[1].get('content', '') for res in gt_responses]
+        
+        # 提取文本內容，處理兩種可能的格式
+        def extract_content(response_data):
+            if isinstance(response_data, dict):
+                return response_data.get('content', '')
+            elif isinstance(response_data, str):
+                return response_data
+            else:
+                return str(response_data)
+        
+        pd_texts = [extract_content(res[1]) for res in pd_responses]
+        gt_texts = [extract_content(res[1]) for res in gt_responses]
 
         n_pred, n_gt = len(pd_fids), len(gt_fids)
         if n_pred == 0 and n_gt == 0:
@@ -595,18 +767,10 @@ class LiveMixin(AutoModelForCausalLM):
         # 構建成本矩陣（L1 差值 on frames）
         cost = [[abs(pi - gi) for gi in gt_fids] for pi in pd_fids]
 
-        # 使用 SciPy 匈牙利匹配；若失敗則退化為排序配對
-        try:
-            from scipy.optimize import linear_sum_assignment  # type: ignore
-            import numpy as np
-            cmat = np.array(cost, dtype=float)
-            rows, cols = linear_sum_assignment(cmat)
-            rows, cols = rows.tolist(), cols.tolist()
-        except Exception:
-            pd_sorted = sorted(range(n_pred), key=lambda i: pd_fids[i])
-            gt_sorted = sorted(range(n_gt), key=lambda j: gt_fids[j])
-            k = min(n_pred, n_gt)
-            rows, cols = pd_sorted[:k], gt_sorted[:k]
+        # 使用匈牙利演算法進行最佳匹配
+        cmat = np.array(cost, dtype=float)
+        rows, cols = linear_sum_assignment(cmat)
+        rows, cols = rows.tolist(), cols.tolist()
 
         # 使用共享的評分器初始化方法
         meteor_fn, rouge_scorer = self._init_text_metric_scorers(text_metric_list)
@@ -664,17 +828,26 @@ def fast_greedy_generate(
     inplace_output_ids: torch.Tensor,
     v_mask: Optional[torch.Tensor] = None,
     frame_interval_mask: Optional[torch.Tensor] = None,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
+    input_ids: Optional[torch.Tensor] = None,
 ):
 
     i = 0
     for i in range(inplace_output_ids.size(1)):
-        outputs = model.forward(inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True, v_mask=v_mask, frame_interval_mask=frame_interval_mask)
+        outputs = model.forward(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+            v_mask=v_mask,
+            frame_interval_mask=frame_interval_mask,
+            input_ids=input_ids,
+        )
         past_key_values = outputs.past_key_values
         new_token_id = outputs.logits[:, -1:].argmax(dim=-1)
         inplace_output_ids[:, i] = new_token_id
         if new_token_id == eos_token_id:
             break
+        input_ids = new_token_id
         inputs_embeds = model.get_input_embeddings()(new_token_id)
         v_mask = torch.zeros((1, new_token_id.shape[1]), device=device, dtype=torch.bool)
         frame_interval_mask = torch.zeros_like(v_mask, device=device, dtype=torch.bool)
