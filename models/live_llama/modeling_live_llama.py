@@ -12,6 +12,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast as BaseModelOu
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer as LlamaDecoderLayerBase
 
+from .infcache_improved import InfCache
 from .configuration_live_llama import LiveLlamaConfig
 from ..modeling_live import build_live, LiveMixin
 from ..connectors import build_connector
@@ -117,7 +118,6 @@ class LlamaDecoderLayer(LlamaDecoderLayerBase):
             output_attentions=output_attentions, 
             use_cache=use_cache, 
             cache_position=cache_position, 
-            **kwargs,
         )
     
     def mod_forward(
@@ -383,7 +383,7 @@ class LlamaModel(LlamaModelBase):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -394,16 +394,17 @@ class LlamaModel(LlamaModelBase):
         frame_interval_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_attentions = True
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
+        # if (input_ids is None) ^ (inputs_embeds is not None):
+        #     raise ValueError(
+        #         "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+        #     )
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once(
@@ -415,10 +416,32 @@ class LlamaModel(LlamaModelBase):
             inputs_embeds = self.embed_tokens(input_ids)
 
         past_seen_tokens = 0
-        if use_cache:  # kept for BC (cache positions)
-            if not isinstance(past_key_values, StaticCache):
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        if use_cache:
+            if self.config.use_infcache:
+                if past_key_values is None or isinstance(past_key_values, StaticCache):
+                    past_key_values = InfCache(
+                        n_max=self.config.n_max,
+                        n_min=self.config.n_min,
+                        num_frame_tokens=self.config.frame_num_tokens,
+                        enable_attention_tracking=False,
+                        eviction_strategy='turn_based',
+                        # turn_eviction_policy='fifo',
+                        use_recent_attend=True,
+                        recent_attend_history_k=128,
+                        protect_newest_turns=5,
+                        protect_oldest_turns=5,
+                        enable_recency_tracking=False,
+                        # recency_weight=0.5,
+                        # top_k_references=5,
+                        enable_rope_repositioning=False,
+                        head_dim=128
+                    )
                 past_seen_tokens = past_key_values.get_seq_length()
+                past_key_values.update_conversation(input_ids)
+            else: # Default to DynamicCache
+                if not isinstance(past_key_values, StaticCache):
+                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                    past_seen_tokens = past_key_values.get_seq_length()
 
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
@@ -430,7 +453,7 @@ class LlamaModel(LlamaModelBase):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens, output_attentions)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -495,6 +518,21 @@ class LlamaModel(LlamaModelBase):
             next_cache = (
                 next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
             )
+            if self.config.use_infcache and isinstance(next_cache, InfCache):
+                # 根據 eviction_strategy 和 turn_eviction_policy 選擇合適的 update 方法
+                if next_cache.eviction_strategy == "turn_based":
+                    
+                    if next_cache.use_recent_attend:
+                        next_cache.update_recent_attend_turn_based(all_self_attns, (past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1]))
+                    # Turn-based 策略：根據 turn_eviction_policy 決定是否需要 attention tracking
+                    elif next_cache.turn_eviction_policy == "reference_based":
+                        next_cache.update_reference_counts_turn_based(all_self_attns)
+                    # turn_eviction_policy == "fifo" 時不需要 attention tracking
+                elif next_cache.eviction_strategy == "reference_based":
+                    next_cache.update_reference_counts(all_self_attns)
+                # eviction_strategy == "fifo" 不需要 update_reference_counts
+                
+                # next_cache.update_memory()
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -515,7 +553,7 @@ class LlamaForCausalLM(LlamaForCausalLMBase):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -563,7 +601,7 @@ class LlamaForCausalLM(LlamaForCausalLMBase):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = torch.nn.CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
@@ -607,10 +645,9 @@ class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        frames: torch.FloatTensor = None,
         attention_mask: torch.Tensor = None,
         position_ids: torch.LongTensor = None,
-        past_key_values: list[torch.FloatTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: torch.FloatTensor = None,
         labels: torch.LongTensor = None,
         use_cache: bool = None,
@@ -618,6 +655,7 @@ class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
         output_hidden_states: bool = None,
         return_dict: bool = None,
         cache_position: torch.LongTensor = None,
+        frames: torch.FloatTensor = None,
         v_mask: Optional[torch.Tensor] = None,
         frame_interval_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -627,6 +665,7 @@ class LiveLlamaForCausalLM(LlamaForCausalLM, LiveMixin):
             frame_interval_mask = input_ids == self.config.frame_token_interval_id if self.config.frame_token_interval_id is not None else torch.zeros_like(input_ids, dtype=torch.bool)
             inputs_embeds = self.joint_embed(input_ids, frames)
         outputs = super().forward(
+            input_ids = input_ids,
             attention_mask = attention_mask,
             position_ids = position_ids,
             past_key_values = past_key_values,

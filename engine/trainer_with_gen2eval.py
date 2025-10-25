@@ -45,12 +45,24 @@ class TrainerWithGenToEval(Trainer):
             if hasattr(self, 'tokenizer') and self.tokenizer is not None:
                 extra_kwargs['tokenizer'] = self.tokenizer
             
+            # 添加預測緩存相關參數（針對 conversation_stream_evaluate）
+            if evaluator == 'conversation_stream_evaluate':
+                if hasattr(self.args, 'prediction_cache_dir') and self.args.prediction_cache_dir:  # type: ignore
+                    extra_kwargs['prediction_cache_dir'] = self.args.prediction_cache_dir  # type: ignore
+                if hasattr(self.args, 'skip_inference'):  # type: ignore
+                    extra_kwargs['skip_inference'] = self.args.skip_inference  # type: ignore
+            
+            # 添加輸出目錄參數（針對 stream_inference）
+            if evaluator == 'stream_inference':
+                if hasattr(self.args, 'output_dir') and self.args.output_dir:  # type: ignore
+                    extra_kwargs['output_dir'] = self.args.output_dir  # type: ignore
+            
             # 合併所有參數
             all_kwargs = {**inputs, **evaluation_kwargs, **extra_kwargs}  # type: ignore
             output_ids = getattr(model, evaluator)(**all_kwargs)
             
             # 處理不同類型的evaluator返回值
-            if evaluator in ['causal_stream_evaluate', 'stream_evaluate', 'conversation_stream_evaluate']:
+            if evaluator in ['causal_stream_evaluate', 'stream_evaluate', 'conversation_stream_evaluate', 'stream_inference']:
                 # 這些evaluator返回評估分數，不需要reshape
                 # 確保output_ids是二維的以符合trainer期望
                 if isinstance(output_ids, (list, tuple)):

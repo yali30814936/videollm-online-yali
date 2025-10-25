@@ -32,7 +32,11 @@ class LiveTrainingArguments(TrainingArguments):
     mod_warmup_steps: int = 0
     is_return_vision_weights: bool = False
     use_conversation_eval: bool = False
-    eval_text_metrics: list[str] = field(default_factory=lambda: ['rougelsum', 'meteor'])
+    prediction_cache_dir: str = None  # 預測結果緩存目錄
+    skip_inference: bool = True  # 是否跳過推理，直接從緩存讀取
+    use_infcache: bool = False  # 是否使用推理緩存
+    n_max: int = 2048  # 最大緩存大小
+    n_min: int = 2048
 
 @dataclass
 class LiveOneTrainingArguments(LiveTrainingArguments):
@@ -47,12 +51,14 @@ class LiveOneTrainingArguments(LiveTrainingArguments):
 class LiveOnePlusTrainingArguments(LiveTrainingArguments):
     live_version: str = 'live1+'
     frame_token_cls: bool = True
-    frame_token_pooled: list[int] = field(default_factory=lambda: [2, 2])
+    frame_token_pooled: list[int] = field(default_factory=lambda: [3, 3])
     frame_num_tokens: int = 5
     frame_fps: int = 2
-    embed_mark: str = '2fps_384_1+2x2'
+    embed_mark: str = '2fps_384_1+3x3'
     frame_token_interval: str = ','
-    max_num_frames: int = 1200 # 10min, 2fps, 1200 frames
+    max_num_frames: int = 120 # 1min, 2fps, 120 frames
+    # max_num_frames: int = 600 # 5min, 2fps, 600 frames
+    # max_num_frames: int = 36000 # 5hr, 2fps, 36000 frames
 
 def get_args_class(live_version: str):
     if live_version == 'live1':

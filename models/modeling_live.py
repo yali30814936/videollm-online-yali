@@ -9,13 +9,27 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from transformers import AutoModelForCausalLM, Cache, PreTrainedTokenizer
 from transformers.utils import logging
 from scipy.optimize import linear_sum_assignment  # type: ignore
-from nltk.translate.meteor_score import meteor_score
 from rouge_score.rouge_scorer import RougeScorer
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
+from transformers.cache_utils import DynamicCache
 
 from .tokenization_live import build_live_tokenizer_and_update_config
 from .vision_live import build_live_vision
+from .live_llama.infcache_improved import CacheOverflowError
+from .live_llama.infcache_improved import InfCache
 
 logger = logging.get_logger(__name__)
+
+# Global lazy-loaded sentence transformer model
+_SENTENCE_TRANSFORMER = None
+
+def get_sentence_transformer():
+    """Lazy load sentence transformer model"""
+    global _SENTENCE_TRANSFORMER
+    if _SENTENCE_TRANSFORMER is None:
+        _SENTENCE_TRANSFORMER = SentenceTransformer('all-MiniLM-L6-v2')
+    return _SENTENCE_TRANSFORMER
 
 class LiveMixin(AutoModelForCausalLM):
     def set_vision_inside(self):
@@ -30,104 +44,181 @@ class LiveMixin(AutoModelForCausalLM):
     def get_input_embeddings(self):
         return self.llm.get_input_embeddings()
 
-    def _get_text_metric_config(self) -> list[str]:
-        """獲取文本評估度量配置，返回標準化的度量名稱列表"""
-        def _normalize_metric_name(name: str) -> str:
-            n = name.strip().lower()
-            if n in ('rouge', 'rougel', 'rouge-l', 'rougel-f1', 'rouge-lsum'):
-                return 'rougelsum'
-            if n in ('meteor',):
-                return 'meteor'
-            if n in ('jaccard', 'jac'):
-                return 'jaccard'
-            return n
-
-        text_metrics_raw = getattr(self.config, 'eval_text_metrics', None)
-        if text_metrics_raw is None:
-            single_metric = getattr(self.config, 'eval_text_metric', 'rougeLsum')
-            if isinstance(single_metric, str) and ',' in single_metric:
-                text_metric_list = [m for m in single_metric.split(',') if m.strip()]
-            else:
-                text_metric_list = [single_metric]
-        else:
-            if isinstance(text_metrics_raw, str):
-                text_metric_list = [m for m in text_metrics_raw.split(',') if m.strip()]
-            else:
-                text_metric_list = list(text_metrics_raw)
-        text_metric_list = [_normalize_metric_name(m) for m in text_metric_list if m]
-        if not text_metric_list:
-            text_metric_list = ['rougelsum']
-        return text_metric_list
-
-    def _init_text_metric_scorers(self, text_metric_list: list[str]) -> tuple:
-        """初始化文本度量所需的評分器
-        返回: (meteor_fn, rouge_scorer)
+    def _evaluate_responses(self, pd_responses, gt_responses, gt_offset_sec: float = 0.0):
         """
-        need_meteor = any(m == 'meteor' for m in text_metric_list)
-        need_rouge = any(m == 'rougelsum' for m in text_metric_list)
-
-        meteor_fn = None
-        rouge_scorer = None
-        if need_meteor:
-            try:
-                meteor_fn = meteor_score
-            except Exception:
-                meteor_fn = None
-        if need_rouge:
-            try:
-                rouge_scorer = RougeScorer(['rougeLsum'], use_stemmer=False)
-            except Exception:
-                rouge_scorer = None
-        return meteor_fn, rouge_scorer
-
-    def _compute_text_similarities(self, hyp: str, ref: str, text_metric_list: list[str], meteor_fn=None, rouge_scorer=None) -> list[float]:
-        """計算預測文本與參考文本之間的相似度
+        使用文本相似度為主的匈牙利演算法配對預測與標註事件
         
         Args:
-            hyp: 預測文本
-            ref: 參考文本
-            text_metric_list: 要使用的度量列表
-            meteor_fn: METEOR 評分函數（可選）
-            rouge_scorer: ROUGE 評分器（可選）
-            
+            pd_responses: 預測的回應列表 [(timestamp_sec, content), ...]
+            gt_responses: 標註的回應列表 [(timestamp_sec, content), ...]
+            gt_offset_sec: GT 時間偏移量（用於時間對齊）
+        
         Returns:
-            每個度量的相似度分數列表
+            torch.float32 tensor [F1@1s, F1@2s, F1@3s, MAE(sec), BERT_Sim_Avg, ROUGE_L_Avg, Text_Sim_Avg, Composite_Score]
+            - F1@1s: F1 score with 1s tolerance
+            - F1@2s: F1 score with 2s tolerance
+            - F1@3s: F1 score with 3s tolerance
+            - MAE: Mean Absolute Error in seconds
+            - BERT_Sim_Avg: Average BERT embedding cosine similarity
+            - ROUGE_L_Avg: Average ROUGE-L F-measure
+            - Text_Sim_Avg: Average combined text similarity (0.6*BERT + 0.4*ROUGE)
+            - Composite_Score: 0.5*F1@1s + 0.5*Text_Sim_Avg
         """
-        def _jaccard(h: str, r: str) -> float:
-            a = set([t for t in re.split(r"[^\w]+", (h or '').lower()) if t])
-            b = set([t for t in re.split(r"[^\w]+", (r or '').lower()) if t])
-            if not a and not b:
-                return 1.0
-            inter = len(a & b)
-            union = len(a | b)
-            return inter / union if union > 0 else 0.0
-
-        sims: list[float] = []
-        for m in text_metric_list:
-            if m == 'meteor':
-                if meteor_fn is not None:
-                    try:
-                        sims.append(float(meteor_fn([ref or ''], hyp or '')))
-                        continue
-                    except Exception:
-                        pass
-                # fallback
-                sims.append(_jaccard(hyp, ref))
-            elif m == 'rougelsum':
-                if rouge_scorer is not None:
-                    try:
-                        score = rouge_scorer.score(ref or '', hyp or '')
-                        sims.append(float(score['rougeLsum'].fmeasure))
-                        continue
-                    except Exception:
-                        pass
-                sims.append(_jaccard(hyp, ref))
-            elif m == 'jaccard':
-                sims.append(_jaccard(hyp, ref))
+        # 提取時間戳記（秒）與文本
+        pd_times_sec = [t for t, _ in pd_responses]
+        gt_times_sec = [t - gt_offset_sec for t, _ in gt_responses]
+        
+        # 提取文本內容
+        def extract_content(response_data):
+            if isinstance(response_data, dict):
+                return response_data.get('content', '')
+            elif isinstance(response_data, str):
+                return response_data
             else:
-                # 未知名稱：退回 Jaccard
-                sims.append(_jaccard(hyp, ref))
-        return sims
+                return str(response_data)
+        
+        pd_texts = [extract_content(res[1]) for res in pd_responses]
+        gt_texts = [extract_content(res[1]) for res in gt_responses]
+
+        n_pred, n_gt = len(pd_times_sec), len(gt_times_sec)
+        
+        # 邊界情況處理
+        if n_pred == 0 and n_gt == 0:
+            # 無事件：所有指標設為完美（8個指標）
+            return torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
+        if n_pred == 0 or n_gt == 0:
+            # 單邊空：F1=0, MAE=0, BERT=0, ROUGE=0, Text_Sim=0, Composite=0
+            return torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+
+        # 初始化評分器
+        sentence_model = get_sentence_transformer()
+        rouge_scorer = RougeScorer(['rougeL'], use_stemmer=False)
+        
+        # 計算文本 embeddings
+        pd_embeddings = sentence_model.encode(pd_texts, convert_to_tensor=True, show_progress_bar=False)
+        gt_embeddings = sentence_model.encode(gt_texts, convert_to_tensor=True, show_progress_bar=False)
+        
+        # 構建成本矩陣：只考慮時間窗口內（±3秒）的配對，並加入時間距離懲罰
+        TIME_WINDOW = 3.0
+        SIMILARITY_THRESHOLD = 0.3
+        LENGTH_RATIO_POWER = 0.6
+        TIME_PENALTY_WEIGHT = 0.3  # 時間距離懲罰權重
+        
+        cost_matrix = np.full((n_pred, n_gt), 1.0, dtype=float)  # 1.0 表示最大成本（最低相似度）
+        
+        # 保存每個配對的 BERT 和 ROUGE-L 分數（用於後續統計）
+        bert_scores = {}  # {(i, j): score}
+        rouge_scores = {}  # {(i, j): score}
+        
+        for i, (pd_time, pd_text, pd_emb) in enumerate(zip(pd_times_sec, pd_texts, pd_embeddings)):
+            for j, (gt_time, gt_text, gt_emb) in enumerate(zip(gt_times_sec, gt_texts, gt_embeddings)):
+                # 檢查時間窗口
+                time_diff = abs(pd_time - gt_time)
+                if time_diff > TIME_WINDOW:
+                    continue  # 超出時間窗口，保持高成本
+                
+                # 計算文本相似度
+                # 1. Cosine similarity (embedding)
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    pd_emb.unsqueeze(0), gt_emb.unsqueeze(0)
+                ).item()
+                
+                # 2. ROUGE-L
+                rouge_score = rouge_scorer.score(gt_text or '', pd_text or '')
+                rouge_l = rouge_score['rougeL'].fmeasure
+                
+                # 保存原始分數
+                bert_scores[(i, j)] = cosine_sim
+                rouge_scores[(i, j)] = rouge_l
+                
+                # 3. 加權平均
+                text_sim = 0.6 * cosine_sim + 0.4 * rouge_l
+                
+                # 4. 長度偏置校正
+                len_pd = len(pd_text) if pd_text else 1
+                len_gt = len(gt_text) if gt_text else 1
+                len_penalty = min(1.0, (len_pd / len_gt) ** LENGTH_RATIO_POWER)
+                adjusted_sim = text_sim * len_penalty
+                
+                # 5. 時間距離懲罰：線性懲罰，時間差越大，相似度越低
+                adjusted_sim = adjusted_sim * (1-TIME_PENALTY_WEIGHT) + (time_diff / TIME_WINDOW) * TIME_PENALTY_WEIGHT
+                
+                # 成本 = 1 - 相似度
+                cost_matrix[i, j] = 1.0 - adjusted_sim
+        
+        # 使用匈牙利演算法找最佳配對
+        row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        
+        # 過濾低於閾值的配對
+        valid_pairs = []
+        for i, j in zip(row_indices, col_indices):
+            similarity = 1.0 - cost_matrix[i, j]
+            if similarity >= SIMILARITY_THRESHOLD:
+                time_diff = abs(pd_times_sec[i] - gt_times_sec[j])
+                # 獲取這個配對的 BERT 和 ROUGE-L 分數
+                bert_sim = bert_scores.get((i, j), 0.0)
+                rouge_l_sim = rouge_scores.get((i, j), 0.0)
+                valid_pairs.append({
+                    'pred_idx': i,
+                    'gt_idx': j,
+                    'time_diff': time_diff,
+                    'similarity': similarity,
+                    'bert_sim': bert_sim,
+                    'rouge_l_sim': rouge_l_sim
+                })
+        
+        # 計算指標
+        n_matched = len(valid_pairs)
+        
+        if n_matched == 0:
+            # 沒有有效配對（8個指標）
+            return torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+        
+        # 1. F1@1s、F1@2s 和 F1@3s
+        n_matched_1s = sum(1 for pair in valid_pairs if pair['time_diff'] <= 1.0)
+        n_matched_2s = sum(1 for pair in valid_pairs if pair['time_diff'] <= 2.0)
+        n_matched_3s = sum(1 for pair in valid_pairs if pair['time_diff'] <= 3.0)
+        
+        precision_1s = n_matched_1s / n_pred
+        recall_1s = n_matched_1s / n_gt
+        f1_1s = (2 * precision_1s * recall_1s / (precision_1s + recall_1s)) if (precision_1s + recall_1s) > 0 else 0.0
+        
+        precision_2s = n_matched_2s / n_pred
+        recall_2s = n_matched_2s / n_gt
+        f1_2s = (2 * precision_2s * recall_2s / (precision_2s + recall_2s)) if (precision_2s + recall_2s) > 0 else 0.0
+        
+        precision_3s = n_matched_3s / n_pred
+        recall_3s = n_matched_3s / n_gt
+        f1_3s = (2 * precision_3s * recall_3s / (precision_3s + recall_3s)) if (precision_3s + recall_3s) > 0 else 0.0
+        
+        # 2. MAE（所有有效配對的平均時間誤差）
+        mae = sum(pair['time_diff'] for pair in valid_pairs) / n_matched
+        
+        # 3. BERT Similarity Average
+        bert_sim_avg = sum(pair['bert_sim'] for pair in valid_pairs) / n_matched
+        
+        # 4. ROUGE-L Average
+        rouge_l_avg = sum(pair['rouge_l_sim'] for pair in valid_pairs) / n_matched
+        
+        # 5. Text Similarity Average（加權平均：0.6*BERT + 0.4*ROUGE）
+        text_sim_avg = sum(pair['similarity'] for pair in valid_pairs) / n_matched
+        
+        # 6. Composite Score
+        composite = 0.5 * f1_1s + 0.5 * text_sim_avg
+        
+        # 在模型設備上構建結果 tensor
+        try:
+            model_device = next(self.parameters()).device
+        except Exception:
+            model_device = torch.device('cpu')
+        
+        result = torch.tensor(
+            [f1_1s, f1_2s, f1_3s, mae, bert_sim_avg, rouge_l_avg, text_sim_avg, composite],
+            dtype=torch.float32,
+            device=model_device
+        )
+        
+        return result
 
     def visual_embed(self, frames: torch.Tensor):
         if hasattr(self, 'vision_encode'):
@@ -162,18 +253,6 @@ class LiveMixin(AutoModelForCausalLM):
         frame_token_interval_threshold: float = 0.0,
         **kwargs
     ):
-        use_advanced_text_sim = hasattr(self.config, 'eval_text_metrics') and self.config.eval_text_metrics is not None
-        llm_response_head_len = len("Assistant: ")
-        
-        _turn_text_sims = []
-        _text_metric_list = None
-        _meteor_fn = None
-        _rouge_scorer = None
-        
-        if use_advanced_text_sim:
-            _text_metric_list = self._get_text_metric_config()
-            _meteor_fn, _rouge_scorer = self._init_text_metric_scorers(_text_metric_list)
-        
         # 0. evaluation only supports batch_size = 1
         assert input_ids.size(0) == labels.size(0) == 1
         input_id, label = input_ids[0], labels[0]
@@ -223,24 +302,6 @@ class LiveMixin(AutoModelForCausalLM):
                 else:
                     num_lm_correct_tokens = (~turn_lm_masked_wrong_mask).sum()
                 lm_correctness.append(num_lm_correct_tokens / turn_lm_masked_label.numel())
-                
-                # 計算文本相似度
-                if use_advanced_text_sim:
-                    tokenizer = kwargs['tokenizer']
-                    # 獲取預測文本
-                    pred_token_ids = turn_lm_masked_logit.argmax(dim=-1)
-                    pred_text = tokenizer.decode(pred_token_ids, skip_special_tokens=True)[llm_response_head_len:]
-                    # 獲取真實文本
-                    ref_text = tokenizer.decode(turn_lm_masked_label, skip_special_tokens=True)[llm_response_head_len:]
-                    
-                    # 計算文本相似度（使用函數級別的評分器）
-                    text_sims = self._compute_text_similarities(
-                        pred_text, ref_text, 
-                        _text_metric_list,
-                        _meteor_fn, 
-                        _rouge_scorer
-                    )
-                    _turn_text_sims.append(text_sims)
 
             ## 3.3. frame_diff (will be casted to time_diff in compute_metrics)
             if turn_stream_mask.any():
@@ -289,7 +350,7 @@ class LiveMixin(AutoModelForCausalLM):
                                 frame_diff = -to_append_num_frames
                 frame_diffs.append(frame_diff.abs())
 
-            ## 2.6 fluency
+            ## 3.4 fluency
             if turn_lm_mask.any() and turn_stream_mask.any():
                 num_learn_v_tokens = turn_stream_mask.sum()
                 num_learn_valid_tokens = turn_lm_masked_label.numel() + num_learn_v_tokens
@@ -300,26 +361,17 @@ class LiveMixin(AutoModelForCausalLM):
                 else:
                     fluency = (num_learn_v_tokens - 1) / num_learn_valid_tokens
                 fluencies.append(fluency)
-            ## 2.7 next turn
+            ## 3.5 next turn
             past_num_frames += turn_num_frames
         lm_ppl = torch.stack(lm_ppls).mean() if lm_ppls else one
         frame_diff = torch.stack(frame_diffs).float().mean() if frame_diffs else zero
         fluency = torch.stack(fluencies).float().mean() if fluencies else one
         lm_correctness = torch.stack(lm_correctness).float().mean() if lm_correctness else one
         
-        # 構建返回結果，格式與 conversation_stream_evaluate 一致
-        # 基礎指標：[lm_ppl, frame_diff, fluency, lm_correctness]
+        # 返回基礎指標：[lm_ppl, frame_diff, fluency, lm_correctness]
         result_list = [lm_ppl, frame_diff, fluency, lm_correctness]
         
-        # 添加文本相似度指標（如果有計算）
-        if use_advanced_text_sim and _turn_text_sims:
-            # 計算每個度量的平均值
-            num_metrics = len(_turn_text_sims[0])
-            for i in range(num_metrics):
-                avg_sim = sum(sims[i] for sims in _turn_text_sims) / len(_turn_text_sims)
-                result_list.append(torch.tensor(avg_sim, dtype=torch.float, device=device))
-        
-        # 在模型設備上構建結果 tensor（與 _evaluate_responses 一致）
+        # 在模型設備上構建結果 tensor
         try:
             model_device = next(self.parameters()).device
         except Exception:
@@ -333,7 +385,7 @@ class LiveMixin(AutoModelForCausalLM):
             else:
                 result_metrics.append(torch.tensor(float(metric), dtype=torch.float32, device=model_device))
         
-        # 返回 [1, N] 形狀的 tensor，與 conversation_stream_evaluate 一致
+        # 返回 [1, N] 形狀的 tensor
         result = torch.stack(result_metrics).unsqueeze(0)
         return result
 
@@ -387,41 +439,59 @@ class LiveMixin(AutoModelForCausalLM):
         conversations: list,
         tokenizer: PreTrainedTokenizer,
         frame_token_interval_threshold: float = 0.725,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 32,
         frame_chunk_size: int = 64,
         prefetch_ratio: int = 5,
         sample_uid: str = None,
         prediction_cache_dir: str = None,
         skip_inference: bool = False,
+        original_times: list = None,  # 原始時間戳記列表（未對齊 frame rate）
         **kwargs
     ):
         """
-        對話流式評估方法，支持兩階段處理：
-        1. 生成階段：運行模型推理並儲存預測結果
-        2. 評估階段：讀取已保存的結果並計算指標
+        對話流式評估方法，支持完全分離的兩階段處理：
+        1. Inference Stage（推理階段）：運行模型推理並儲存預測結果
+        2. Evaluation Stage（評估階段）：讀取已保存的結果並計算指標
         
         Args:
             sample_uid: 測資的唯一識別碼（通常是 video_uid 或 annotation_uid）
-            prediction_cache_dir: 預測結果緩存目錄
-            skip_inference: 是否跳過推理階段，直接從緩存讀取
+            prediction_cache_dir: 預測結果緩存目錄（必須提供以啟用兩階段模式）
+            skip_inference: 跳過推理階段，直接從緩存讀取並評估
+            original_times: GT 事件的原始時間戳記列表（秒），未對齊 frame rate
+        
+        Returns:
+            - 評估指標 tensor [F1@1s, F1@2s, MAE, Text_Sim_Avg, Composite_Score]
         """
-        # 如果提供了緩存目錄，檢查是否已有結果
+        # ====================================================================
+        # Stage 1: Inference (可選，依據 skip_inference 決定)
+        # ====================================================================
         if prediction_cache_dir and sample_uid:
             cache_path = self._get_prediction_cache_path(prediction_cache_dir, sample_uid)
             
-            # 如果要求跳過推理或已有緩存，嘗試從緩存讀取
-            if skip_inference or os.path.exists(cache_path):
-                cached_result = self._load_prediction_from_cache(cache_path)
+            # 檢查是否需要執行推理
+            need_inference = not os.path.exists(cache_path)
+            
+            if not skip_inference:
+                if not need_inference:
+                    return self._get_zero_metrics()
+            else:
+                # 直接從緩存讀取並評估
+                max_time = self.config.max_num_frames / self.config.frame_fps
+                cached_result = self._load_prediction_from_cache(cache_path, max_time)
                 if cached_result is not None:
                     logger.info(f"Loaded cached prediction for {sample_uid}")
                     return self._evaluate_responses(
                         cached_result['pd_responses'], 
-                        cached_result['gt_responses']
+                        cached_result['gt_responses'],
                     )
-                elif skip_inference:
-                    logger.warning(f"skip_inference=True but cache not found for {sample_uid}, skipping...")
-                    # 返回全零指標
+                else:
+                    logger.warning(f"Failed to load cache for {sample_uid}")
                     return self._get_zero_metrics()
+                
+        
+        # ====================================================================
+        # 執行推理階段（生成預測）
+        # ====================================================================
         
         # 執行推理生成預測
         device = self.model.device
@@ -432,6 +502,10 @@ class LiveMixin(AutoModelForCausalLM):
         query_queue = deque()
         gt_responses = []
         pd_responses = []
+        
+        # 獲取 fps 用於時間轉換
+        fps = float(getattr(self.config, 'frame_fps', 2) or 2)
+        fps = fps if fps > 0 else 1.0
 
         # Prefetch frames to device (non-blocking)
         if stream_frames:
@@ -445,108 +519,430 @@ class LiveMixin(AutoModelForCausalLM):
             frame_buffer = frames
 
         # Prepare for response generation
+        # 同時構建原始時間戳記的索引
         fid = 0
+        gt_time_index = 0  # 用於追蹤 original_times 的索引
         for conv in conversations:
             if conv['role'] == 'system' or conv['role'] == 'user':
                 query_queue.append((fid, conv))
             elif conv['role'] == 'assistant':
-                gt_responses.append((fid, conv))
+                # 使用原始時間戳記（如果提供）
+                if original_times and gt_time_index < len(original_times):
+                    original_time = original_times[gt_time_index]
+                    gt_responses.append((original_time, conv))  # 直接使用原始時間（秒）
+                    gt_time_index += 1
+                else:
+                    # 沒有原始時間時，使用 frame index 轉換的時間
+                    gt_responses.append((fid / fps, conv))
             elif conv['role'] == 'stream':
                 fid += conv['num_frames']
 
         # Process frames
         last_role = None
         
-        # 如果需要緩存，準備緩存路徑和即時保存機制
+        # 準備緩存路徑
         cache_path = None
         if prediction_cache_dir and sample_uid:
             cache_path = self._get_prediction_cache_path(prediction_cache_dir, sample_uid)
         
-        for fid, frame in enumerate(frame_buffer):
-            turn_conversations = []
-            while query_queue and query_queue[0][0] == fid:
-                _, conv = query_queue.popleft()
-                turn_conversations.append(conv)
-            if turn_conversations:
-                state['last_ids'] = tokenizer.apply_chat_template(
-                    turn_conversations,
-                    add_stream_query_prompt=(last_role == 'stream'),
-                    add_generation_prompt=(turn_conversations[-1]['role'] == 'user'),
-                    add_stream_prompt=(turn_conversations[-1]['role'] != 'user'),
-                    add_stream_generation_prompt=False,
-                    return_tensors='pt'
-                ).to(device)
-                if last_role == 'assistant':
+        # 計算總幀數用於進度條
+        if stream_frames:
+            total_frames = frame_buffer.num_frames
+        else:
+            total_frames = frames.shape[0]
+        
+        # 創建進度條
+        uid_display = (sample_uid[:20] + '...') if sample_uid and len(sample_uid) > 23 else (sample_uid or 'video')
+        
+        frame_pbar = tqdm(
+            total=total_frames,
+            desc=f"▸ {uid_display}",
+            position=1,
+            leave=False,
+            ncols=None,
+            unit='f',
+        )
+        
+        # 記錄處理狀態
+        processing_status = "success"
+        last_processed_frame = 0
+        
+        # 記錄 peak memory usage
+        peak_kv_tokens = 0  # KV cache 的最大 token 數量
+        peak_vram_gb = 0.0  # 最大 VRAM 使用量（GB）
+        
+        try:
+            for fid, frame in enumerate(frame_buffer):
+                # 更新進度條
+                frame_pbar.update(1)
+                last_processed_frame = fid
+                turn_conversations = []
+                while query_queue and query_queue[0][0] == fid:
+                    _, conv = query_queue.popleft()
+                    turn_conversations.append(conv)
+                if turn_conversations:
+                    state['last_ids'] = tokenizer.apply_chat_template(
+                        turn_conversations,
+                        add_stream_query_prompt=(last_role == 'stream'),
+                        add_generation_prompt=(turn_conversations[-1]['role'] == 'user'),
+                        add_stream_prompt=(turn_conversations[-1]['role'] != 'user'),
+                        add_stream_generation_prompt=False,
+                        return_tensors='pt'
+                    ).to(device)
+                    if last_role == 'assistant':
+                        state['last_ids'] = torch.cat([
+                            torch.tensor([[tokenizer.eos_token_id]], device=device),
+                            state['last_ids']], dim=1)
+                    last_role = turn_conversations[-1]['role']
+                elif last_role == 'assistant':
                     state['last_ids'] = torch.cat([
                         torch.tensor([[tokenizer.eos_token_id]], device=device),
-                        state['last_ids']], dim=1)
-                last_role = turn_conversations[-1]['role']
-            elif last_role == 'assistant':
-                state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
-            
-            if last_role == 'user':
-                output_ids = self._simulate_stream_response(state=state, device=device)
-                pd_responses.append((fid, {
-                    'role': 'assistant',
-                    'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
-                }))
-                last_role = 'assistant'
-                state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
+                        state['_added_stream_prompt_ids']], dim=1)
                 
-            next_token = self._simulate_stream_step(state, frame)
-            last_role = 'stream'
-            if next_token == 933: #]\n
-                state['last_ids'] = state['_added_stream_generation_ids'].to(device)
-                output_ids = self._simulate_stream_response(state=state, device=device)
-                pd_responses.append((fid, {
-                    'role': 'assistant',
-                    'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
-                }))
-                last_role = 'assistant'
+                if last_role == 'user':
+                    output_ids = self._simulate_stream_response(state=state, device=device)
+                    pd_responses.append((fid / fps, {
+                        'role': 'assistant',
+                        'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
+                    }))
+                    last_role = 'assistant'
+                    state['last_ids'] = torch.cat([state['last_ids'], state['_added_stream_prompt_ids']], dim=1)
+                    
+                next_token = self._simulate_stream_step(state, frame)
+                last_role = 'stream'
+                if next_token == 933: #]\n
+                    state['last_ids'] = state['_added_stream_generation_ids'].to(device)
+                    output_ids = self._simulate_stream_response(state=state, device=device)
+                    pd_responses.append((fid / fps, {
+                        'role': 'assistant',
+                        'content': tokenizer.decode(output_ids[0], skip_special_tokens=True)[1:]
+                    }))
+                    last_role = 'assistant'
+                
+                # 記錄 peak memory usage
+                if torch.cuda.is_available():
+                    # 記錄 VRAM 使用量
+                    current_vram_gb = torch.cuda.memory_allocated(device) / 1e9
+                    peak_vram_gb = max(peak_vram_gb, current_vram_gb)
+                    
+                    # 記錄 KV cache 的 token 數量
+                    if state.get('past_key_values') is not None:
+                        kv_cache = state['past_key_values']
+                        if isinstance(kv_cache, InfCache):
+                            current_kv_tokens = kv_cache.actual_cache_length
+                        elif isinstance(kv_cache, DynamicCache):
+                            current_kv_tokens = kv_cache.get_seq_length()
+                        else:
+                            # 假設 HF Cache 結構
+                            current_kv_tokens = kv_cache[0][0].size(2)
+                        peak_kv_tokens = max(peak_kv_tokens, current_kv_tokens)
 
+                if self.config.use_infcache:
+                    state['past_key_values'].update_memory()
+        except CacheOverflowError as e:
+            processing_status = "cache_overflow"
+            logger.info(f"Cache overflow during inference for {sample_uid}: {e}")
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" in str(e).lower():
+                processing_status = "cuda_oom"
+                logger.info(f"CUDA OOM during inference for {sample_uid}: {str(e)[:200]}")
+                
+                # 記錄 OOM 前的記憶體狀態
+                device_id = torch.cuda.current_device()
+                allocated_before = torch.cuda.memory_allocated(device_id) / 1e9
+                reserved_before = torch.cuda.memory_reserved(device_id) / 1e9
+                logger.info(f"Memory BEFORE cleanup: allocated={allocated_before:.2f}GB, reserved={reserved_before:.2f}GB")
+                
+                # ============================================================
+                # 超級積極的記憶體清理策略
+                # ============================================================
+                import gc
+                
+                # 步驟 1: 診斷 - 找出最大的 tensor
+                logger.info("Diagnosing large tensors...")
+                large_tensors = []
+                try:
+                    for obj in gc.get_objects():
+                        if torch.is_tensor(obj):
+                            if obj.is_cuda:
+                                size_mb = obj.element_size() * obj.nelement() / 1024 / 1024
+                                if size_mb > 10:  # 大於 10MB 的 tensor
+                                    large_tensors.append((size_mb, obj.shape, type(obj).__name__))
+                    large_tensors.sort(reverse=True)
+                    for size_mb, shape, typename in large_tensors[:10]:  # 顯示前 10 個最大的
+                        logger.info(f"  - {size_mb:.1f}MB: {shape} ({typename})")
+                except Exception as diag_e:
+                    logger.warning(f"Diagnostic failed: {diag_e}")
+                
+                # 步驟 2: 清理 KV cache（最關鍵！）
+                logger.info("Cleaning KV cache...")
+                kv_freed = False
+                try:
+                    if state and 'past_key_values' in state and state['past_key_values'] is not None:
+                        kv_cache = state['past_key_values']
+                        logger.info(f"  KV cache type: {type(kv_cache).__name__}")
+                        
+                        # 清理 DynamicCache / HF Cache
+                        if hasattr(kv_cache, 'key_cache') and hasattr(kv_cache, 'value_cache'):
+                            num_layers = len(kv_cache.key_cache)
+                            logger.info(f"  Clearing {num_layers} layers...")
+                            for i in range(num_layers):
+                                if kv_cache.key_cache[i] is not None:
+                                    del kv_cache.key_cache[i]
+                                if kv_cache.value_cache[i] is not None:
+                                    del kv_cache.value_cache[i]
+                            kv_cache.key_cache.clear()
+                            kv_cache.value_cache.clear()
+                            kv_freed = True
+                        
+                        # 刪除 cache 對象本身
+                        del state['past_key_values']
+                        state['past_key_values'] = None
+                        logger.info(f"  KV cache deleted: {kv_freed}")
+                except Exception as kv_e:
+                    logger.warning(f"KV cache cleanup failed: {kv_e}")
+                
+                # 步驟 3: 清理所有 state 內容
+                logger.info("Cleaning state dict...")
+                try:
+                    if state:
+                        # 刪除所有已知的大對象
+                        for key in ['inplace_output_ids', 'last_ids', '_added_stream_prompt_ids', 
+                                    '_added_stream_generation_ids', 'inputs_embeds', 'attention_mask']:
+                            if key in state:
+                                del state[key]
+                        
+                        # 刪除所有 tensor
+                        tensor_keys = [k for k, v in state.items() if isinstance(v, torch.Tensor)]
+                        for key in tensor_keys:
+                            del state[key]
+                        
+                        logger.info(f"  Cleared {len(tensor_keys)} tensors from state")
+                        state.clear()
+                except Exception as state_e:
+                    logger.warning(f"State cleanup failed: {state_e}")
+                
+                # 步驟 4: 清理 frame buffer 和 frames
+                logger.info("Cleaning frames...")
+                try:
+                    # frame_buffer 可能是 FrameCache 對象或直接是 tensor
+                    if frame_buffer is not None:
+                        if hasattr(frame_buffer, 'buffer'):
+                            del frame_buffer.buffer
+                        if hasattr(frame_buffer, 'cpu_frames'):
+                            del frame_buffer.cpu_frames
+                    
+                    # frames 是函數參數，設為 None（不要刪除，會影響外部）
+                    # 但可以嘗試釋放內部數據
+                    del frame_buffer
+                except Exception as frame_e:
+                    logger.warning(f"Frame cleanup failed: {frame_e}")
+                
+                # 步驟 5: 多輪垃圾回收
+                logger.info("Running garbage collection...")
+                collected = [gc.collect() for _ in range(3)]
+                logger.info(f"  GC collected: {sum(collected)} objects")
+                
+                # 步驟 6: 清空 CUDA cache
+                logger.info("Emptying CUDA cache...")
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            else:
+                processing_status = "other_error"
+                raise
+        finally:
+            frame_pbar.close()
+
+        # 計算處理資訊
+        video_duration_sec = total_frames / fps
+        processed_duration_sec = (last_processed_frame + 1) / fps
+        completion_rate = processed_duration_sec / video_duration_sec if video_duration_sec > 0 else 0.0
+        
+        # 在處理結束後記錄最終的 KV cache token 數量
+        total_kv_tokens = 0
+        if state.get('past_key_values') is not None:
+            kv_cache = state['past_key_values']
+            if isinstance(kv_cache, DynamicCache):
+                total_kv_tokens = kv_cache.get_seq_length()
+            else:
+                # 假設 HF Cache 結構
+                total_kv_tokens = kv_cache[0][0].size(2)
+        
+        # 保存推理結果到緩存
         if cache_path:
             self._save_prediction_to_cache(
                 cache_path=cache_path,
                 sample_uid=sample_uid,
                 pd_responses=pd_responses,
-                gt_responses=gt_responses
+                gt_responses=gt_responses,
+                fps=fps,
+                processing_status=processing_status,
+                total_frames=total_frames,
+                processed_frames=last_processed_frame + 1,
+                video_duration_sec=video_duration_sec,
+                processed_duration_sec=processed_duration_sec,
+                completion_rate=completion_rate,
+                peak_kv_tokens=peak_kv_tokens,
+                peak_vram_gb=peak_vram_gb,
+                total_kv_tokens=total_kv_tokens
             )
-
-        return self._evaluate_responses(pd_responses, gt_responses)
-
+        
+        # ====================================================================
+        # Stage 2: Evaluation（可選，依據 skip_evaluation 決定）
+        # ====================================================================
+        
+        if not skip_inference:
+            # 只執行推理，不評估（節省 VRAM）
+            logger.info(f"Inference completed for {sample_uid}, skipping evaluation")
+            return None
+        
+        # 如果發生錯誤，返回零指標
+        if processing_status in ["cuda_oom", "other_error"]:
+            logger.info(f"Returning zero metrics for {sample_uid} due to {processing_status}")
+            # 最終清理
+            if torch.cuda.is_available():
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            return self._get_zero_metrics()
+        
+        # 計算 GT 時間偏移量
+        gt_time_offset = gt_responses[0][0] if gt_responses else 0.0
+        
+        # 執行評估（使用 Sentence-BERT）
+        return self._evaluate_responses(
+            pd_responses, 
+            gt_responses,
+            gt_offset_sec=gt_time_offset
+        )
+    
     def _get_prediction_cache_path(self, cache_dir: str, sample_uid: str) -> str:
         """獲取預測結果的緩存路徑"""
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         return os.path.join(cache_dir, f"{sample_uid}.json")
     
-    def _save_prediction_to_cache(self, cache_path: str, sample_uid: str, pd_responses: list, gt_responses: list):
+    def _save_inference_to_file(self, output_dir: str, sample_uid: str, pd_responses: list, fps: float = 2.0, num_frames: int = 0):
+        """將純推理結果保存到檔案
+        
+        Args:
+            output_dir: 輸出目錄
+            sample_uid: 影片唯一識別碼
+            pd_responses: 生成的回應列表 [(timestamp_sec, content), ...]
+            fps: 影格率
+            num_frames: 影片總幀數
+        """
+        import json
+        import os
+        from pathlib import Path
+        
+        # 提取時間戳記和內容（不做時間平移，保留原始時間）
+        def extract_data(responses):
+            result = []
+            for timestamp_sec, resp in responses:
+                content = resp if isinstance(resp, str) else str(resp)
+                result.append([timestamp_sec, content])
+            return result
+        
+        output_data = {
+            'sample_uid': sample_uid,
+            'responses': extract_data(pd_responses),
+            'fps': fps,
+            'num_frames': num_frames,
+            'duration_sec': num_frames / fps if fps > 0 else 0.0
+        }
+        
+        # 寫入 JSON 檔案
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            output_path = os.path.join(output_dir, f"{sample_uid}.json")
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved inference result to {output_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save inference result: {e}")
+    
+    def _save_prediction_to_cache(
+        self, 
+        cache_path: str, 
+        sample_uid: str, 
+        pd_responses: list, 
+        gt_responses: list, 
+        fps: float = 2.0,
+        processing_status: str = "success",
+        total_frames: int = 0,
+        processed_frames: int = 0,
+        video_duration_sec: float = 0.0,
+        processed_duration_sec: float = 0.0,
+        completion_rate: float = 1.0,
+        peak_kv_tokens: int = 0,
+        peak_vram_gb: float = 0.0,
+        total_kv_tokens: int = 0
+    ):
         """將預測結果保存到緩存檔案
         
         Args:
             cache_path: 緩存檔案路徑
             sample_uid: 測資唯一識別碼
-            pd_responses: 預測的回應列表 [(frame_id, response_dict), ...]
-            gt_responses: 標註的回應列表 [(frame_id, response_dict), ...]
-        """
-        # 獲取 fps 用於時間轉換
-        fps = float(getattr(self.config, 'frame_fps', 2) or 2)
-        fps = fps if fps > 0 else 1.0
+            pd_responses: 預測的回應列表 [(timestamp_sec, response_dict), ...]
+            gt_responses: 標註的回應列表 [(timestamp_sec, response_dict), ...]
+            fps: 影格率（用於記錄）
+            processing_status: 處理狀態 ("success", "cache_overflow", "cuda_oom", "other_error")
+            total_frames: 影片總幀數
+            processed_frames: 實際處理的幀數
+            video_duration_sec: 影片總時長（秒）
+            processed_duration_sec: 實際處理的時長（秒）
+            completion_rate: 完成率 (0.0-1.0)
+            peak_kv_tokens: KV cache 的峰值 token 數量
+            peak_vram_gb: 峰值 VRAM 使用量（GB）
+            total_kv_tokens: 影片處理結束後的總 token 數量
         
-        # 將 frame index 轉換為秒，並只保留 content（移除 role）
-        def convert_to_seconds(responses):
+        注意：
+        - gt_responses 的時間戳記會被平移，使第一個事件的時間為 0
+        - pd_responses 保留原始時間戳記（相對於影片幀位置）
+        """
+        # 提取時間戳記和內容，並對 GT 時間進行平移
+        def extract_gt_data(responses):
             result = []
-            for fid, resp in responses:
-                timestamp = fid / fps
+            # 找到第一個事件的時間作為偏移量
+            time_offset = responses[0][0] if responses else 0.0
+            
+            for timestamp_sec, resp in responses:
                 # 只保留 content，移除 role 和其他不需要的欄位
                 content = resp.get('content', '') if isinstance(resp, dict) else str(resp)
-                result.append([timestamp, content])
+                # 平移時間，使第一個事件為 0
+                shifted_time = timestamp_sec - time_offset
+                result.append([shifted_time, content])
+            return result, time_offset
+        
+        def extract_pd_data(responses):
+            result = []
+            for timestamp_sec, resp in responses:
+                # 只保留 content，移除 role 和其他不需要的欄位
+                content = resp.get('content', '') if isinstance(resp, dict) else str(resp)
+                result.append([timestamp_sec, content])
             return result
+        
+        gt_data, time_offset = extract_gt_data(gt_responses)
+        pd_data = extract_pd_data(pd_responses)
         
         cache_data = {
             'sample_uid': sample_uid,
-            'pd_responses': convert_to_seconds(pd_responses),
-            'gt_responses': convert_to_seconds(gt_responses),
-            'fps': fps
+            'pd_responses': pd_data,
+            'gt_responses': gt_data,
+            'fps': fps,
+            'gt_time_offset': time_offset,  # 記錄 GT 的時間偏移量，以便必要時還原
+            # 處理狀態資訊
+            'processing_status': processing_status,
+            'total_frames': total_frames,
+            'processed_frames': processed_frames,
+            'video_duration_sec': video_duration_sec,
+            'processed_duration_sec': processed_duration_sec,
+            'completion_rate': completion_rate,
+            # 峰值記憶體使用量
+            'peak_kv_tokens': peak_kv_tokens,
+            'peak_vram_gb': peak_vram_gb,
+            'total_kv_tokens': total_kv_tokens
         }
         
         # 寫入 JSON 檔案（一個檔案一筆測資）
@@ -559,11 +955,11 @@ class LiveMixin(AutoModelForCausalLM):
         except Exception as e:
             logger.warning(f"Failed to save prediction to {cache_path}: {e}")
     
-    def _load_prediction_from_cache(self, cache_path: str) -> Optional[dict]:
+    def _load_prediction_from_cache(self, cache_path: str, max_time: float = 0.0) -> Optional[dict]:
         """從緩存檔案讀取預測結果
         
         Returns:
-            包含 pd_responses 和 gt_responses 的字典，時間戳記已轉回 frame index
+            包含 pd_responses, gt_responses, gt_time_offset 的字典
             如果讀取失敗則返回 None
         """
         if not os.path.exists(cache_path):
@@ -573,31 +969,29 @@ class LiveMixin(AutoModelForCausalLM):
             with open(cache_path, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
-            # 獲取 fps
-            fps = cache_data.get('fps', 2.0)
-            
-            # 將秒轉換回 frame index
-            # 緩存格式: [[timestamp, content], ...]
-            # 返回格式: [(frame_id, content), ...] - 直接返回字符串，與 _evaluate_responses 的 extract_content 兼容
-            def convert_to_frames(responses):
+            # 緩存格式: [[timestamp_sec, content], ...]
+            # 返回格式: [(timestamp_sec, content), ...] - 直接返回字符串
+            def parse_responses(responses):
                 result = []
                 for item in responses:
                     if isinstance(item, list) and len(item) >= 2:
-                        timestamp, content = item[0], item[1]
-                        fid = int(round(timestamp * fps))
-                        # 直接返回字符串內容，不需要包裝成字典
+                        timestamp_sec, content = item[0], item[1]
+                        if max_time > 0.0 and timestamp_sec > max_time:
+                            break
+                        # 直接返回字符串內容
                         if isinstance(content, dict):
                             # 兼容舊格式（如果有）
-                            result.append((fid, content.get('content', '')))
+                            result.append((timestamp_sec, content.get('content', '')))
                         else:
-                            result.append((fid, content))
+                            result.append((timestamp_sec, content))
                     else:
                         logger.warning(f"Unexpected cache format: {item}")
                 return result
             
             return {
-                'pd_responses': convert_to_frames(cache_data['pd_responses']),
-                'gt_responses': convert_to_frames(cache_data['gt_responses'])
+                'pd_responses': parse_responses(cache_data['pd_responses']),
+                'gt_responses': parse_responses(cache_data['gt_responses']),
+                'gt_time_offset': cache_data.get('gt_time_offset', 0.0)  # 讀取 GT 時間偏移量
             }
         except Exception as e:
             logger.warning(f"Failed to load prediction from {cache_path}: {e}")
@@ -605,8 +999,8 @@ class LiveMixin(AutoModelForCausalLM):
     
     def _get_zero_metrics(self):
         """返回全零的指標，用於跳過的測資"""
-        text_metric_list = self._get_text_metric_config()
-        num_metrics = 2 + len(text_metric_list) + 1  # time_mae, time_acc, text_metrics..., f1
+        # 指標格式：[F1@1s, F1@2s, F1@3s, MAE, BERT_Sim_Avg, ROUGE_L_Avg, Text_Sim_Avg, Composite_Score]
+        num_metrics = 8
         
         try:
             model_device = next(self.parameters()).device
@@ -723,101 +1117,6 @@ class LiveMixin(AutoModelForCausalLM):
         # 合併流式處理模板
         state.update(stream_templates)
         return state
-
-    def _evaluate_responses(self, pd_responses, gt_responses):
-        """
-        使用匈牙利演算法（最小化 |Δframe|）將預測與標註配對，並計算：
-        - time_mae: 平均時間誤差（秒），由 |Δframe| / fps 換算
-        - time_acc: 時間誤差在 3 幀（= 3/fps 秒）以內的比例
-        - text_sim: 文本相似度（預設 ROUGE-Lsum F1，可透過 self.config.eval_text_metric == 'meteor' 改用 METEOR），匹配對取平均
-        - f1: 事件級配對的 F1（匹配數與預測/標註數量的調和平均）
-
-        回傳: torch.float32 tensor [time_mae(sec), time_acc(<=3/fps s), text_sim, f1]
-        """
-
-        # 使用共享的配置獲取方法
-        text_metric_list = self._get_text_metric_config()
-
-        # 提取 frame index 與文本（兼容字典和字符串兩種格式）
-        pd_fids = [fid for fid, _ in pd_responses]
-        gt_fids = [fid for fid, _ in gt_responses]
-        
-        # 提取文本內容，處理兩種可能的格式
-        def extract_content(response_data):
-            if isinstance(response_data, dict):
-                return response_data.get('content', '')
-            elif isinstance(response_data, str):
-                return response_data
-            else:
-                return str(response_data)
-        
-        pd_texts = [extract_content(res[1]) for res in pd_responses]
-        gt_texts = [extract_content(res[1]) for res in gt_responses]
-
-        n_pred, n_gt = len(pd_fids), len(gt_fids)
-        if n_pred == 0 and n_gt == 0:
-            # 無事件：時間 MAE=0, time_acc=1, 每個文字指標=1, F1=1
-            out_vec = [0.0, 1.0] + [1.0] * len(text_metric_list) + [1.0]
-            return torch.tensor(out_vec, dtype=torch.float32)
-        if n_pred == 0 or n_gt == 0:
-            # 單邊空：全部 0（除了時間 MAE=0）
-            out_vec = [0.0, 0.0] + [0.0] * len(text_metric_list) + [0.0]
-            return torch.tensor(out_vec, dtype=torch.float32)
-
-        # 構建成本矩陣（L1 差值 on frames）
-        cost = [[abs(pi - gi) for gi in gt_fids] for pi in pd_fids]
-
-        # 使用匈牙利演算法進行最佳匹配
-        cmat = np.array(cost, dtype=float)
-        rows, cols = linear_sum_assignment(cmat)
-        rows, cols = rows.tolist(), cols.tolist()
-
-        # 使用共享的評分器初始化方法
-        meteor_fn, rouge_scorer = self._init_text_metric_scorers(text_metric_list)
-
-        # 匹配後計算指標
-        abs_diffs_frames = []
-        text_sims_all: list[list[float]] = []
-        for pi, gi in zip(rows, cols):
-            abs_diffs_frames.append(abs(pd_fids[pi] - gt_fids[gi]))
-            # 使用共享的文本相似度計算方法
-            text_sims_all.append(self._compute_text_similarities(
-                pd_texts[pi], gt_texts[gi], 
-                text_metric_list, 
-                meteor_fn, 
-                rouge_scorer
-            ))
-
-        matched = len(abs_diffs_frames)
-        fps = float(getattr(self.config, 'frame_fps', 2) or 2)
-        fps = fps if fps > 0 else 1e-6
-        diffs_sec = [d / fps for d in abs_diffs_frames]
-        time_mae = float(sum(diffs_sec) / matched) if matched > 0 else 0.0
-        tol_sec = 3.0 / fps
-        time_acc = float(sum(1 for s in diffs_sec if s <= tol_sec) / matched) if matched > 0 else 0.0
-        # 逐指標平均
-        if matched > 0:
-            sums = [0.0] * len(text_metric_list)
-            for sims in text_sims_all:
-                for i, v in enumerate(sims):
-                    sums[i] += float(v)
-            text_avgs = [s / matched for s in sums]
-        else:
-            text_avgs = [0.0] * len(text_metric_list)
-
-        precision = matched / n_pred if n_pred > 0 else 0.0
-        recall = matched / n_gt if n_gt > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-        out_vec = [time_mae, time_acc] + text_avgs + [f1]
-        # 在模型裝置上建立結果，避免分散式蒐集報 CUDA/dense 錯誤
-        try:
-            model_device = next(self.parameters()).device
-        except Exception:
-            model_device = None
-        if model_device is not None:
-            return torch.tensor(out_vec, dtype=torch.float32, device=model_device)
-        return torch.tensor(out_vec, dtype=torch.float32)
 
 def fast_greedy_generate(
     *,
